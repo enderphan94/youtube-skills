@@ -1,0 +1,18 @@
+{
+  "name": "youtube-skills",
+  "owner": {
+    "name": "Ender Phan",
+    "url": "https://github.com/enderphan94"
+  },
+  "metadata": {
+    "description": "YouTube summary and transcript skills for Claude"
+  },
+  "plugins": [
+    {
+      "name": "youtube-skills",
+      "source": "./",
+      "description": "Summarize any YouTube video (youtube-sum) and fetch full transcripts / subtitles (youtube-sub), with captions, auto-captions and a Gemini audio fallback.",
+      "version": "1.0.0"
+    }
+  ]
+}

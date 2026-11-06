@@ -1,0 +1,12 @@
+{
+  "name": "youtube-skills",
+  "version": "1.0.0",
+  "description": "Summarize any YouTube video (youtube-sum) and fetch full transcripts / subtitles (youtube-sub), with captions, auto-captions and a Gemini audio fallback.",
+  "author": {
+    "name": "Ender Phan",
+    "url": "https://github.com/enderphan94"
+  },
+  "homepage": "https://github.com/enderphan94/youtube-skills",
+  "repository": "https://github.com/enderphan94/youtube-skills",
+  "keywords": ["youtube", "transcript", "subtitles", "captions", "summary", "srt"]
+}
