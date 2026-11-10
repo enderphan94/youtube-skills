@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -17,7 +18,6 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SUB = ROOT / "skills" / "youtube-sub" / "scripts"
-SUM = ROOT / "skills" / "youtube-sum" / "scripts"
 
 
 def load(name, path):
@@ -28,7 +28,7 @@ def load(name, path):
 
 
 ft = load("fetch_transcript", SUB / "fetch_transcript.py")
-pc = load("polish_check", SUB / "polish_check.py")
+ac = load("apply_corrections", SUB / "apply_corrections.py")
 
 
 def cues(*texts):
@@ -43,15 +43,6 @@ class Track:
         self.is_generated = generated
         self.is_translatable = translatable
         self.language = name or code
-
-
-class SharedCopies(unittest.TestCase):
-    def test_fetcher_copies_identical(self):
-        self.assertEqual(
-            (SUB / "fetch_transcript.py").read_bytes(),
-            (SUM / "fetch_transcript.py").read_bytes(),
-            "run ./tools/build.sh to sync the shared fetcher",
-        )
 
 
 class VideoId(unittest.TestCase):
@@ -382,23 +373,63 @@ class Chain(unittest.TestCase):
         self.assertEqual(code, ft.EXIT_UNAVAILABLE)
         gem.assert_not_called()
 
-    def test_captions_success_writes_parts(self):
-        segs = [{"start": float(i * 3), "duration": 3.0, "text": f"This is sentence {i}."} for i in range(400)]
-        res = {"source": "captions", "transcript_type": "manual", "language": "English",
-               "language_code": "en", "translated_to": None, "segments": segs,
-               "available_tracks": ["en", "en (auto)"]}
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch.object(ft, "ensure_library", return_value=True), \
+    def captions(self, kind, n=400):
+        segs = [{"start": float(i * 3), "duration": 3.0, "text": f"this is sentence {i}"} for i in range(n)]
+        return {"source": "captions", "transcript_type": kind, "language": "English",
+                "language_code": "en", "translated_to": None, "segments": segs,
+                "available_tracks": ["en (auto)"]}
+
+    def fetch(self, res, *flags):
+        with mock.patch.object(ft, "ensure_library", return_value=True), \
              mock.patch.object(ft, "fetch_oembed", return_value={"title": "My Talk", "channel": "C"}), \
-             mock.patch.object(ft, "fetch_captions", return_value=res):
-            code, out = self.run_main(["abcdefghijk", "--quiet", "--out-dir", tmp, "--chunk-chars", "2000"])
-            report = json.loads(out)
-            self.assertEqual(code, 0)
-            self.assertTrue(report["out"].endswith("my-talk-abcdefghijk.txt"))
-            self.assertEqual(report["duration"], "20:00")
-            self.assertGreater(len(report["parts"]), 3)
-            joined = " ".join(Path(p["path"]).read_text() for p in report["parts"])
-            self.assertEqual(joined.split(), ft.render_text(res).split())
+             mock.patch.object(ft, "fetch_captions", return_value=res), \
+             mock.patch.object(ft.tempfile, "gettempdir", return_value=self.tmp):
+            code, out = self.run_main(["abcdefghijk", "--quiet", "--out-dir", self.tmp, *flags])
+        self.assertEqual(code, 0)
+        return json.loads(out)
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+
+    def test_human_captions_are_final(self):
+        report = self.fetch(self.captions("manual"))
+        self.assertTrue(report["out"].endswith("my-talk-abcdefghijk.txt"))
+        self.assertEqual(report["duration"], "20:00")
+        self.assertNotIn("needs_correction", report)
+        self.assertNotIn("parts", report)
+
+    def test_auto_captions_get_parts(self):
+        res = self.captions("auto", n=1000)
+        report = self.fetch(res)
+        self.assertTrue(report["needs_correction"])
+        self.assertGreater(len(report["parts"]), 1)
+        self.assertTrue((Path(report["parts_dir"]) / "corrected").is_dir())
+        joined = " ".join(Path(p).read_text() for p in report["parts"])
+        self.assertEqual(joined.split(), ft.render_text(res).split())
+
+    def test_raw_and_translated_skip_correction(self):
+        self.assertNotIn("needs_correction", self.fetch(self.captions("auto"), "--raw"))
+        self.assertNotIn("needs_correction", self.fetch(self.captions("auto"), "--format", "json"))
+        translated = dict(self.captions("auto"), translated_to="vi")
+        self.assertNotIn("needs_correction", self.fetch(translated))
+
+    def test_srt_round_trip(self):
+        """Fetch an auto .srt, correct its cue lines, apply: text changes, timing doesn't."""
+        report = self.fetch(self.captions("auto", n=5), "--format", "srt")
+        before = Path(report["out"]).read_text()
+        part = Path(report["parts"][0])
+        self.assertEqual(part.read_text().splitlines()[0], "[1] this is sentence 0")
+        fixed = part.read_text().replace("this is", "This is").replace("\n", ".\n")
+        (part.parent / "corrected" / part.name).write_text(fixed)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ac.main(["--parts-dir", report["parts_dir"], "--out", report["out"]])
+        self.assertEqual(json.loads(out.getvalue())["accepted"], 1)
+        after = Path(report["out"]).read_text()
+        self.assertIn("1\n00:00:00,000 --> 00:00:03,000\nThis is sentence 0.\n", after)
+        self.assertEqual(re.findall(r".* --> .*", before), re.findall(r".* --> .*", after))
 
     def test_bad_input(self):
         code, out = self.run_main(["https://vimeo.com/1", "--quiet"])
@@ -406,54 +437,84 @@ class Chain(unittest.TestCase):
         self.assertFalse(json.loads(out)["ok"])
 
 
-class PolishCheck(unittest.TestCase):
+class Corrections(unittest.TestCase):
     ORIGINAL = ("ngài đã theo đuổi lối tu khổ hạnh và hành xác quá rệt ăn uống ngủ nghỉ "
                 "ngày đã tự hành hạ bản thân mình một cách khắc nghiệt nhưng điều quan trọng là")
 
     def test_accepts_light_repair(self):
-        polished = ("Ngài đã theo đuổi lối tu khổ hạnh và hành xác quá mức: ăn uống, ngủ nghỉ. "
-                    "Ngài đã tự hành hạ bản thân mình một cách khắc nghiệt. Nhưng điều quan trọng là")
-        ok, why = pc.check(self.ORIGINAL, polished)
+        fixed = ("Ngài đã theo đuổi lối tu khổ hạnh và hành xác quá mức: ăn uống, ngủ nghỉ. "
+                 "Ngài đã tự hành hạ bản thân mình một cách khắc nghiệt. Nhưng điều quan trọng là")
+        ok, why = ac.check(self.ORIGINAL, fixed)
+        self.assertTrue(ok, why)
+
+    def test_unicode_composition_ignored(self):
+        import unicodedata
+        ok, why = ac.check(unicodedata.normalize("NFD", self.ORIGINAL), self.ORIGINAL.capitalize() + ".")
+        self.assertTrue(ok, why)
+        self.assertTrue(why.startswith("0%"), why)
+
+    def test_unspaced_scripts_compared_per_character(self):
+        ok, why = ac.check("今日は天気がいいですね 散歩に行きましょう", "今日は天気がいいですね。散歩に行きましょう。")
         self.assertTrue(ok, why)
 
     def test_rejects_summary(self):
-        ok, why = pc.check(self.ORIGINAL, "Ngài tu khổ hạnh.")
+        ok, why = ac.check(self.ORIGINAL, "Ngài tu khổ hạnh.")
         self.assertFalse(ok)
         self.assertIn("length", why)
 
     def test_rejects_language_drift(self):
-        ok, why = pc.check(self.ORIGINAL, "他追求苦行，折磨自己的身体，饮食睡眠都极度克制，但重要的是" * 2)
+        ok, why = ac.check(self.ORIGINAL, "他追求苦行，折磨自己的身体，饮食睡眠都极度克制，但重要的是" * 2)
         self.assertFalse(ok)
         self.assertIn("drift", why)
 
     def test_rejects_paraphrase(self):
-        polished = ("Thầy từng sống rất kham khổ, hành hạ thân xác bằng cách nhịn ăn và thức "
-                    "khuya liên tục, nhưng rồi thầy nhận ra một điều quan trọng hơn hết thảy")
-        ok, why = pc.check(self.ORIGINAL, polished)
+        fixed = ("Thầy từng sống rất kham khổ, hành hạ thân xác bằng cách nhịn ăn và thức "
+                 "khuya liên tục, nhưng rồi thầy nhận ra một điều quan trọng hơn hết thảy")
+        ok, why = ac.check(self.ORIGINAL, fixed)
         self.assertFalse(ok)
         self.assertIn("words changed", why)
 
-    def test_assemble_falls_back(self):
+    def test_markers_must_survive(self):
+        original = "[00:00] hello world how are you\n[00:30] i am fine thank you"
+        ok, why = ac.check(original, "[00:00] Hello world, how are you?\n[00:30] I am fine, thank you.")
+        self.assertTrue(ok, why)
+        ok, why = ac.check(original, "[00:00] Hello world, how are you? I am fine, thank you.")
+        self.assertFalse(ok)
+        self.assertIn("timestamps", why)
+
+    def apply(self, t):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = ac.main(["--parts-dir", str(t / "parts"), "--out", str(t / "talk.txt")])
+        self.assertEqual(code, 0)
+        return json.loads(out.getvalue())
+
+    def test_rejected_part_keeps_original(self):
         with tempfile.TemporaryDirectory() as tmp:
             t = Path(tmp)
-            (t / "parts" / "polished").mkdir(parents=True)
+            (t / "parts" / "corrected").mkdir(parents=True)
             (t / "parts" / "part-01.txt").write_text("hello world how are you today my friend")
             (t / "parts" / "part-02.txt").write_text("second part stays as it is")
-            (t / "parts" / "polished" / "part-01.txt").write_text("Hello world, how are you today, my friend?")
-            (t / "transcript.txt").write_text("Title:    X\nURL:      https://y\n\nbody\n")
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                code = pc.main(["--original-dir", str(t / "parts"), "--polished-dir",
-                                str(t / "parts" / "polished"), "--out", str(t / "final.txt"),
-                                "--header-from", str(t / "transcript.txt")])
-            report = json.loads(out.getvalue())
-            self.assertEqual(code, 0)
+            (t / "parts" / "corrected" / "part-01.txt").write_text("Hello world, how are you today, my friend?")
+            (t / "talk.txt").write_text("Title:    X\nURL:      https://y\n\nraw body\n")
+            report = self.apply(t)
             self.assertEqual(report["accepted"], 1)
-            self.assertEqual(report["kept_original"], [{"part": "part-02.txt", "reason": "missing"}])
-            final = (t / "final.txt").read_text()
-            self.assertTrue(final.startswith("Title:    X\nURL:      https://y\nPolished:"))
-            self.assertIn("Hello world, how are you today, my friend?", final)
-            self.assertIn("second part stays as it is", final)
+            self.assertEqual(report["kept_original"], [{"part": "part-02.txt", "reason": "missing or empty"}])
+            final = (t / "talk.txt").read_text()
+            self.assertTrue(final.startswith("Title:    X\nURL:      https://y\nCorrected:"))
+            self.assertIn("Hello world, how are you today, my friend?\n\nsecond part stays as it is", final)
+            self.assertNotIn("raw body", final)
+            self.apply(t)  # running again must not stack a second "Corrected:" line
+            self.assertEqual((t / "talk.txt").read_text(), final)
+
+    def test_nothing_accepted_leaves_file_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            (t / "parts").mkdir()
+            (t / "parts" / "part-01.txt").write_text("hello world")
+            (t / "talk.txt").write_text("Title:    X\n\nhello world\n")
+            self.assertEqual(self.apply(t)["accepted"], 0)
+            self.assertEqual((t / "talk.txt").read_text(), "Title:    X\n\nhello world\n")
 
 
 if __name__ == "__main__":

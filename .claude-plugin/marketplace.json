@@ -5,14 +5,14 @@
     "url": "https://github.com/enderphan94"
   },
   "metadata": {
-    "description": "YouTube summary and transcript skills for Claude"
+    "description": "YouTube subtitle and transcript skill for Claude"
   },
   "plugins": [
     {
       "name": "youtube-skills",
       "source": "./",
-      "description": "Summarize any YouTube video (youtube-sum) and fetch full transcripts / subtitles (youtube-sub), with captions, auto-captions and a Gemini audio fallback.",
-      "version": "1.0.0"
+      "description": "Get the subtitles or transcript of any YouTube video (youtube-sub). Uses the video's own subtitles, and has Claude correct YouTube's auto-generated captions when there are none.",
+      "version": "2.0.0"
     }
   ]
 }

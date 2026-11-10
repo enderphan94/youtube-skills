@@ -1,7 +1,7 @@
-# Polishing an auto-caption transcript
+# Correcting an auto-generated transcript
 
 Ported from YouGist's transcript-polish prompts (`main.py`, `build_prompts`).
-Polishing is a **repair** task, not a writing task. The output is the same talk,
+Correcting is a **repair** task, not a writing task. The output is the same talk,
 sentence for sentence, with the speech-recognition mistakes removed.
 
 ## Your role for each part
@@ -48,10 +48,26 @@ in the output.
 - No title, headings, footnotes, Markdown, or any note about what you changed.
 - Output only the corrected text of that part, nothing else.
 
-`polish_check.py` rejects a section, keeping the original captions, when it
-uses a writing system the original doesn't, changes length by more than 2x, or
-changes more than 30% of the words. Rewriting freely therefore loses the
-section entirely.
+## Parts with `[mm:ss]` or `[N]` markers
+
+Timestamped transcripts and `.srt` subtitles come as one line per marker:
+`[12:30] text` or `[42] text`. The marker ties the line to its place in the
+video, so:
+
+- Keep every marker exactly as it is, at the start of its own line, in the same
+  order. Never merge, split, add, drop or renumber lines.
+- Correct only the text after the marker. Do not move words from one line to
+  another, and do not add paragraph breaks.
+- A sentence may run across several lines. Punctuate and capitalize as if the
+  lines were joined: a line can end without a full stop and the next can start
+  in lower case.
+
+## Verification
+
+`apply_corrections.py` rejects a part, keeping the original captions, when a
+marker changed, when it uses a writing system the original doesn't, when its
+length changes by more than 2x, or when more than 30% of the words change.
+Rewriting freely therefore loses the part entirely.
 
 ## Vietnamese, and Southern accents in particular
 

@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""
+apply_corrections.py - verify Claude's corrected parts and write them into the
+transcript file.
+
+fetch_transcript.py splits an auto-generated transcript into part-NN.txt files.
+Claude writes a corrected copy of each into the "corrected" subfolder. This
+script checks every corrected part against its original and rewrites the
+transcript file (text, timestamped text or .srt) with the parts that pass.
+
+Published work on ASR post-correction finds that an UNVERIFIED correction pass
+is worse on average than doing nothing, so every check fails closed: a part
+that looks wrong keeps its original caption text, and nothing is ever lost.
+The checks are a port of YouGist's polishLooksSane() (background.js).
+
+A corrected part is rejected when:
+  1. it is missing or empty;
+  2. its [mm:ss] timestamps or [N] cue numbers differ from the original's;
+  3. it contains a writing system the original did not (language drift);
+  4. its length changed by more than 2x either way (summarized or padded);
+  5. more than 30% of its words differ from the original once punctuation and
+     case are ignored (paraphrased instead of fixing mis-heard words).
+
+USAGE
+  python3 apply_corrections.py --parts-dir DIR --out TRANSCRIPT_FILE
+
+  DIR is "parts_dir" from the fetch report: part-NN.txt plus
+  corrected/part-NN.txt. TRANSCRIPT_FILE is the report's "out"; it is rewritten
+  in place. Prints a JSON report.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+import unicodedata
+from difflib import SequenceMatcher
+from pathlib import Path
+
+MAX_EDIT_RATE = 0.3
+
+# Scripts a model might wander into that the source almost certainly wasn't in:
+# kana, CJK, Hangul, Cyrillic, Hebrew, Arabic.
+FOREIGN_SCRIPT_RE = re.compile(
+    "[぀-ヿ㐀-䶿一-鿿가-힯"
+    "Ѐ-ӿ֐-׿؀-ۿ]"
+)
+# Scripts written without spaces between words: compare these per character.
+_UNSPACED_RE = re.compile("([぀-ヿ㐀-䶿一-鿿฀-๿])")
+# A line-leading [mm:ss] / [h:mm:ss] timestamp or [N] cue number.
+MARKER_RE = re.compile(r"^\[(\d+(?::\d\d){0,2})\]", re.MULTILINE)
+_HEADER_LINE_RE = re.compile(r"^[A-Z][A-Za-z ]{1,15}:\s")
+CORRECTED_NOTE = (
+    "Corrected: punctuation and mis-heard words repaired by Claude; parts that "
+    "failed verification keep the original caption text"
+)
+
+
+def script_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    return len(FOREIGN_SCRIPT_RE.findall(text)) / len(text)
+
+
+def content_tokens(text: str) -> list:
+    """The words of a part, ignoring what correction is allowed to change:
+    punctuation, case, markers and Unicode composition (captions are often
+    NFD, Claude writes NFC)."""
+    text = unicodedata.normalize("NFC", MARKER_RE.sub(" ", text or "")).lower()
+    text = "".join(" " if unicodedata.category(c)[0] in "PS" else c for c in text)
+    return _UNSPACED_RE.sub(r" \1 ", text).split()
+
+
+def edit_rate(a: list, b: list) -> float:
+    """Word-level edit rate, (max(n, m) - matched) / n.
+
+    difflib's matching blocks are a lower bound on the LCS, so this can only
+    overestimate the edit rate, which errs toward rejecting: the safe side.
+    """
+    n, m = len(a), len(b)
+    if not n:
+        return 1.0 if m else 0.0
+    matched = sum(block.size for block in SequenceMatcher(None, a, b, autojunk=False).get_matching_blocks())
+    return (max(n, m) - matched) / n
+
+
+def check(original: str, corrected: str):
+    """Return (accepted, reason)."""
+    if not corrected or not corrected.strip():
+        return False, "missing or empty"
+    if MARKER_RE.findall(corrected) != MARKER_RE.findall(original):
+        return False, "timestamps or cue numbers were changed, added or dropped"
+    before, after = script_ratio(original), script_ratio(corrected)
+    if after > 0.02 and after > before * 3 + 0.01:
+        return False, "language drift (a writing system the original does not use)"
+    ratio = len(corrected) / max(1, len(original))
+    if ratio < 0.5 or ratio > 2.0:
+        return False, f"length changed {ratio:.2f}x (summarized or padded)"
+    rate = edit_rate(content_tokens(original), content_tokens(corrected))
+    if rate > MAX_EDIT_RATE:
+        return False, f"{rate:.0%} of words changed (paraphrased, limit {MAX_EDIT_RATE:.0%})"
+    return True, f"{rate:.0%} of words changed"
+
+
+def split_header(document: str):
+    """Split a transcript file into its Title/URL/... header lines and the rest."""
+    lines = document.splitlines()
+    n = 0
+    while n < len(lines) and _HEADER_LINE_RE.match(lines[n]):
+        n += 1
+    return lines[:n], "\n".join(lines[n:]).strip()
+
+
+def rebuild_srt(srt: str, sections: list) -> str:
+    """Put corrected "[N] text" lines back into cue N; timing is untouched."""
+    texts = {}
+    for section in sections:
+        for line in section.splitlines():
+            m = re.match(r"^\[(\d+)\]\s*(.*)$", line.strip())
+            if m and m.group(2).strip():
+                texts[m.group(1)] = m.group(2).strip()
+    blocks = []
+    for block in re.split(r"\n\s*\n", srt.strip()):
+        lines = block.splitlines()
+        if len(lines) >= 3 and lines[0].strip() in texts:
+            lines = lines[:2] + [texts[lines[0].strip()]]
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) + "\n"
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Verify corrected parts and rewrite the transcript file.")
+    ap.add_argument("--parts-dir", required=True,
+                    help="'parts_dir' from the fetch report (part-NN.txt and corrected/part-NN.txt)")
+    ap.add_argument("--out", required=True, help="the transcript file to rewrite ('out' from the fetch report)")
+    args = ap.parse_args(argv)
+
+    parts_dir, out = Path(args.parts_dir).expanduser(), Path(args.out).expanduser()
+    parts = sorted(parts_dir.glob("part-*.txt"))
+    if not parts:
+        print(json.dumps({"ok": False, "error": f"no part-*.txt files in {parts_dir}"}))
+        return 2
+    if not out.exists():
+        print(json.dumps({"ok": False, "error": f"transcript file not found: {out}"}))
+        return 2
+
+    sections, rejected = [], []
+    for part in parts:
+        original = part.read_text(encoding="utf-8").strip()
+        fixed_path = parts_dir / "corrected" / part.name
+        fixed = fixed_path.read_text(encoding="utf-8").strip() if fixed_path.exists() else ""
+        ok, reason = check(original, fixed)
+        sections.append(fixed if ok else original)
+        if not ok:
+            rejected.append({"part": part.name, "reason": reason})
+
+    accepted = len(parts) - len(rejected)
+    if accepted:
+        document = out.read_text(encoding="utf-8")
+        if out.suffix.lower() == ".srt":
+            document = rebuild_srt(document, sections)
+        else:
+            header, _ = split_header(document)
+            if header and CORRECTED_NOTE not in header:
+                header.append(CORRECTED_NOTE)
+            # Timestamped parts are lines, plain-text parts are paragraphs.
+            joiner = "\n" if MARKER_RE.search(sections[0]) else "\n\n"
+            body = joiner.join(sections).strip()
+            document = ("\n".join(header) + "\n\n" if header else "") + body + "\n"
+        out.write_text(document, encoding="utf-8")
+
+    print(json.dumps({
+        "ok": True,
+        "out": str(out),
+        "parts": len(parts),
+        "accepted": accepted,
+        "kept_original": rejected or None,
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

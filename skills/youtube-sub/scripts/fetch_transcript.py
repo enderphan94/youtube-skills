@@ -2,8 +2,8 @@
 """
 fetch_transcript.py - fetch the full transcript of any YouTube video.
 
-Shared by the `youtube-sub` and `youtube-sum` Claude skills. The transcript
-logic is ported from YouGist (github.com/enderphan94/yousumchrome): caption
+Part of the `youtube-sub` Claude skill. The transcript logic is ported from
+YouGist (github.com/enderphan94/yousumchrome): caption
 selection and cleanup from main.py, and the Gemini audio-transcription path
 from eval/run_eval.py, used here as the fallback for videos with no captions.
 
@@ -31,6 +31,14 @@ OUTPUT
   the transcript was written to a file, or to stderr when the transcript
   itself is on stdout.
 
+CORRECTION HAND-OFF
+  Human-made captions are final. Auto-generated captions have mis-heard words
+  and little punctuation, so when the transcript written to a file came from
+  an auto-generated track the report says "needs_correction": true and the
+  body is also split into part-NN.txt files (in a temp folder, "parts_dir")
+  for Claude to correct. apply_corrections.py then verifies the corrected
+  parts and rewrites the transcript file. --raw skips all of this.
+
 ENVIRONMENT
   GEMINI_API_KEY / GOOGLE_API_KEY   enables the Gemini fallback
   GEMINI_MODEL                      default: gemini-2.5-flash
@@ -53,6 +61,7 @@ import re
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.error
@@ -61,7 +70,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 REQUIREMENT = "youtube-transcript-api>=1.2,<2"
 DEFAULT_BACKEND = "https://yougist.kuberscan.com"
@@ -81,6 +90,10 @@ BROWSER_UA = (
 # Hard ceiling on transcript length, from YouGist: ~600k chars is ~10 hours of
 # speech, so in practice nothing is cut. Bounds memory on pathological input.
 MAX_TRANSCRIPT_CHARS = 600_000
+
+# Size of the parts handed to Claude for correction. Small enough that a part
+# is rewritten in one go without drifting, large enough to carry context.
+CORRECTION_PART_CHARS = 8000
 
 EXIT_OK, EXIT_USAGE, EXIT_UNAVAILABLE, EXIT_NO_TRANSCRIPT = 0, 2, 3, 4
 
@@ -963,17 +976,50 @@ def render_timestamped(result, group_seconds: float, long_ts: bool) -> str:
     return "\n\n".join(blocks)
 
 
-def render_srt(segments) -> str:
-    cues = [(s["start"], s["duration"], clean_cue(s["text"])) for s in segments]
-    cues = [(st, du, strip_fillers(tx)) for st, du, tx in cues if tx]
+def srt_cues(segments) -> list:
+    """Cleaned, non-empty cues as (start, end, text). Cue N is list item N-1."""
+    cues = [(s["start"], s["duration"], strip_fillers(clean_cue(s["text"]))) for s in segments]
     cues = [c for c in cues if c[2]]
     out = []
     for i, (start, dur, text) in enumerate(cues):
         end = start + (dur if dur > 0 else 2.0)
         if i + 1 < len(cues) and cues[i + 1][0] > start:
             end = min(end, cues[i + 1][0])  # ASR cues overlap; don't stack them
-        out.append(f"{i + 1}\n{fmt_srt_time(start)} --> {fmt_srt_time(end)}\n{text}\n")
-    return "\n".join(out)
+        out.append((start, end, text))
+    return out
+
+
+def render_srt(segments) -> str:
+    return "\n".join(
+        f"{i}\n{fmt_srt_time(start)} --> {fmt_srt_time(end)}\n{text}\n"
+        for i, (start, end, text) in enumerate(srt_cues(segments), 1)
+    )
+
+
+def render_cue_lines(segments) -> str:
+    """The SRT's text only, one "[N] text" line per cue, for correction.
+
+    Timing never goes to the model: apply_corrections.py puts the corrected
+    text back into cue N of the .srt file.
+    """
+    return "\n".join(f"[{i}] {text}" for i, (_, _, text) in enumerate(srt_cues(segments), 1))
+
+
+def correction_dir(video_id: str, fmt: str) -> Path:
+    return Path(tempfile.gettempdir()) / "youtube-sub" / f"{video_id}-{fmt}"
+
+
+def write_parts(folder: Path, text: str) -> list:
+    """Split text into fresh part-NN.txt files, clearing any earlier run."""
+    (folder / "corrected").mkdir(parents=True, exist_ok=True)
+    for stale in [*folder.glob("part-*.txt"), *(folder / "corrected").glob("part-*.txt")]:
+        stale.unlink()
+    paths = []
+    for i, piece in enumerate(chunk_text(text, CORRECTION_PART_CHARS), 1):
+        p = folder / f"part-{i:02d}.txt"
+        p.write_text(piece + "\n", encoding="utf-8")
+        paths.append(str(p))
+    return paths
 
 
 def source_detail(result) -> str:
@@ -1057,9 +1103,8 @@ def main(argv=None) -> int:
     ap.add_argument("--out", help="write the transcript to this file")
     ap.add_argument("--out-dir", help="write into this directory, naming the file after the title")
     ap.add_argument("--no-header", action="store_true", help="omit the Title/URL/Source header")
-    ap.add_argument("--chunk-chars", type=int, default=0,
-                    help="also split the transcript body into part-NN.txt files of <= N chars")
-    ap.add_argument("--chunk-dir", help="directory for the part files (default: <out>.parts)")
+    ap.add_argument("--raw", action="store_true",
+                    help="keep auto-generated captions as they are: do not prepare parts for correction")
     ap.add_argument("--source", choices=["auto", "captions", "backend", "gemini"], default="auto")
     ap.add_argument("--no-backend", action="store_true", help="never use the hosted YouGist backend")
     ap.add_argument("--no-gemini", action="store_true", help="never use Gemini")
@@ -1226,29 +1271,13 @@ def main(argv=None) -> int:
             ext = f".{code}.srt" if code else ".srt"
         out_path = Path(args.out_dir).expanduser() / (stem + ext)
 
-    chunk_files = []
-    if args.chunk_chars and args.chunk_chars > 0:
-        if args.chunk_dir:
-            chunk_dir = Path(args.chunk_dir).expanduser()
-        elif out_path:
-            name = out_path.name
-            for suffix in (".timestamped.txt", ".txt", ".json", ".srt"):
-                if name.endswith(suffix):
-                    name = name[: -len(suffix)]
-                    break
-            chunk_dir = out_path.parent / f"{name}.parts"
-        else:
-            print(json.dumps({"ok": False, "error": "--chunk-chars needs --out, --out-dir or --chunk-dir"}))
-            return EXIT_USAGE
-        chunk_dir.mkdir(parents=True, exist_ok=True)
-        for stale in chunk_dir.glob("part-*.txt"):
-            stale.unlink()
-        source_body = body if fmt in ("text", "timestamped") else render_text(result)
-        pieces = chunk_text(source_body, args.chunk_chars)
-        for i, piece in enumerate(pieces, 1):
-            p = chunk_dir / f"part-{i:02d}.txt"
-            p.write_text(piece + "\n", encoding="utf-8")
-            chunk_files.append({"path": str(p), "chars": len(piece)})
+    # Auto-generated captions (not machine-translated ones: their errors are
+    # the translator's, not mis-hearings) are handed to Claude for correction.
+    parts, parts_dir = [], None
+    if (out_path and not args.raw and fmt != "json"
+            and result["transcript_type"] == "auto" and not result.get("translated_to")):
+        parts_dir = correction_dir(video_id, fmt)
+        parts = write_parts(parts_dir, render_cue_lines(segments) if fmt == "srt" else body)
 
     plain = render_text(result) if fmt != "text" else body
     report = {
@@ -1258,8 +1287,10 @@ def main(argv=None) -> int:
         "cues": body.count(" --> ") if fmt == "srt" else None,
         "chars": len(plain),
         "words": len(plain.split()),
-        "out": str(out_path) if out_path else None,
-        "parts": chunk_files or None,
+        "out": str(out_path.resolve()) if out_path else None,
+        "needs_correction": True if parts else None,
+        "parts_dir": str(parts_dir) if parts else None,
+        "parts": parts or None,
         "attempts": attempts,
         "warnings": warnings or None,
     }
