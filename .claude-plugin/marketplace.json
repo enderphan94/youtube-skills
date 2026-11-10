@@ -11,8 +11,8 @@
     {
       "name": "youtube-skills",
       "source": "./",
-      "description": "Get the subtitles or transcript of any YouTube video (youtube-sub). Uses the video's own subtitles, and has Claude correct YouTube's auto-generated captions when there are none.",
-      "version": "2.0.0"
+      "description": "Get the subtitles or transcript of any YouTube video (youtube-sub). Uses the video's own subtitles, has Claude correct YouTube's auto-generated captions when there are none, and transcribes the audio locally with Whisper when the video has no captions at all.",
+      "version": "2.1.0"
     }
   ]
 }

@@ -6,7 +6,8 @@ description: Get the subtitles / transcript of any YouTube video as clean text, 
 # YouTube subtitles (`youtube-sub`)
 
 Fetches a video's subtitles and saves them as a file. Human-made subtitles are
-used as they are. Auto-generated captions are corrected by you (section 2).
+used as they are. Auto-generated captions are corrected by you (section 2). A
+video with no captions at all has its audio transcribed locally (section 4).
 
 In the commands below, `SKILL_DIR` means this skill's folder. Claude Code shows
 it as "Base directory for this skill". On Claude.ai or in the desktop chat it is

@@ -40,9 +40,10 @@ OUTPUT
   itself is on stdout.
 
 CORRECTION HAND-OFF
-  Human-made captions are final. Auto-generated captions have mis-heard words
-  and little punctuation, so when the transcript written to a file came from
-  an auto-generated track the report says "needs_correction": true and the
+  Human-made captions are final. Auto-generated captions and local Whisper
+  transcripts have mis-heard words and weak punctuation, so when the transcript
+  written to a file came from either of them the report says
+  "needs_correction": true and the
   body is also split into part-NN.txt files (in a temp folder, "parts_dir")
   for Claude to correct. apply_corrections.py then verifies the corrected
   parts and rewrites the transcript file. --raw skips all of this.
@@ -82,7 +83,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 REQUIREMENT = "youtube-transcript-api>=1.2,<2"
 # yt-dlp[default] brings yt-dlp-ejs, which YouTube downloads need since 2025.

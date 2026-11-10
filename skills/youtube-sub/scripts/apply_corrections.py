@@ -3,14 +3,15 @@
 apply_corrections.py - verify Claude's corrected parts and write them into the
 transcript file.
 
-fetch_transcript.py splits an auto-generated transcript into part-NN.txt files.
+fetch_transcript.py splits a machine-made transcript (YouTube auto-captions or
+a local Whisper transcription) into part-NN.txt files.
 Claude writes a corrected copy of each into the "corrected" subfolder. This
 script checks every corrected part against its original and rewrites the
 transcript file (text, timestamped text or .srt) with the parts that pass.
 
 Published work on ASR post-correction finds that an UNVERIFIED correction pass
 is worse on average than doing nothing, so every check fails closed: a part
-that looks wrong keeps its original caption text, and nothing is ever lost.
+that looks wrong keeps its original text, and nothing is ever lost.
 The checks are a port of YouGist's polishLooksSane() (background.js).
 
 A corrected part is rejected when:
@@ -54,7 +55,7 @@ MARKER_RE = re.compile(r"^\[(\d+(?::\d\d){0,2})\]", re.MULTILINE)
 _HEADER_LINE_RE = re.compile(r"^[A-Z][A-Za-z ]{1,15}:\s")
 CORRECTED_NOTE = (
     "Corrected: punctuation and mis-heard words repaired by Claude; parts that "
-    "failed verification keep the original caption text"
+    "failed verification keep the original text"
 )
 
 

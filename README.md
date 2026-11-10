@@ -14,7 +14,8 @@ Paste a link and ask:
 
 > Get the subtitles of https://youtu.be/8jPQjjsBbIc
 
-No API key is needed. The Claude you are already chatting with does the correcting.
+No API key is needed. The Claude you are already chatting with does the correcting,
+and audio is transcribed on your own computer.
 
 ## What you can ask for
 
@@ -89,23 +90,29 @@ computer the link alone works.
 
 ```mermaid
 flowchart TD
-    U([You: a YouTube link]) --> F[fetch_transcript.py<br/>lists the video's caption tracks]
-    F --> Q{What captions<br/>does it have?}
+    U([A YouTube link]) --> F[fetch_transcript.py<br/>lists the video's caption tracks.<br/>If YouTube blocks this machine, it asks<br/>the hosted YouGist backend instead]
+    F --> Q{What captions<br/>does the video have?}
 
-    Q -- "human-made subtitles" --> H[Download them]
+    Q -- "human-made subtitles" --> H[Download them.<br/>Final as they are]
     Q -- "only auto-generated" --> A[Download the auto-captions]
-    Q -- "none at all" --> D[yt-dlp downloads the audio]
-    L([You: an audio or video file]) --> W
-    D --> W[faster-whisper transcribes it<br/>on your computer]
+    Q -- "none at all" --> G{GEMINI_API_KEY set?}
+
+    G -- "yes" --> GM[Gemini fetches the video itself<br/>and transcribes the audio.<br/>No per-line timing]
+    G -- "no" --> D{Can yt-dlp download<br/>the audio here?}
+    D -- "yes: your own computer" --> W[faster-whisper transcribes<br/>the audio locally, with timing]
+    D -- "no: chat sandbox,<br/>blocked network" --> X([You download the video<br/>and attach the file])
+    L([An audio or video file]) --> W
+    X --> W
 
     A --> P[Split into parts<br/>of about 8,000 characters]
     W --> P
-    P --> C[Claude corrects each part:<br/>mis-heard words, punctuation,<br/>capitals, paragraphs]
+    P --> C[Claude corrects each part:<br/>mis-heard words, punctuation,<br/>capitals, invented lines removed]
     C --> V{apply_corrections.py<br/>checks each part}
     V -- "pass" --> M[Corrected text goes into the file.<br/>For .srt, timing is never touched]
-    V -- "fail: paraphrased, summarized,<br/>wrong language, lost a timestamp" --> K[That part keeps the<br/>original text]
+    V -- "fail: paraphrased, summarized,<br/>wrong language, lost a timestamp" --> K[That part keeps<br/>the original text]
 
     H --> O([Your file: .txt, timestamped .txt, .srt or .json])
+    GM --> O
     M --> O
     K --> O
     O --> N([Ask Claude anything about it:<br/>summary, notes, translation, quotes])
@@ -120,14 +127,17 @@ The pieces:
 | [`references/correction-guide.md`](skills/youtube-sub/references/correction-guide.md) | The rules Claude follows when correcting: fix errors, never rewrite, summarize or translate |
 | [`scripts/apply_corrections.py`](skills/youtube-sub/scripts/apply_corrections.py) | Verifies Claude's corrections and writes the ones that pass into the file |
 
+The audio path uses two open-source tools, installed on first use: [yt-dlp](https://github.com/yt-dlp/yt-dlp) to download the audio track and [faster-whisper](https://github.com/SYSTRAN/faster-whisper) to transcribe it.
+
 Design choices worth knowing:
 
-- **Track choice.** Human-made subtitles in the language actually spoken come
-  first, then the auto-generated track, then other languages.
+- **Order of preference.** Human-made subtitles in the language actually spoken
+  come first, then the auto-generated track, then other languages, and only
+  then the audio.
 - **Corrections are verified, not trusted.** A corrected part is thrown away if
   more than 30% of its words changed, its length changed by more than 2x, it
   switched writing system, or a timestamp or cue number moved. The original
-  caption text is used for that part instead, so nothing is lost.
+  text is used for that part instead, so nothing is lost.
 - **Subtitle timing is safe.** For `.srt` files Claude only ever sees
   `[cue number] text` lines. The timing stays in the file and is never rewritten.
 - **When YouTube blocks your network** (common on cloud and VPN addresses), the
