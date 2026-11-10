@@ -58,6 +58,9 @@ video, so:
   order. Never merge, split, add, drop or renumber lines.
 - Correct only the text after the marker. Do not move words from one line to
   another, and do not add paragraph breaks.
+- The one exception: a line the recognizer invented over music or silence, which
+  nobody actually says (a credit, "thanks for watching", "subscribe"). Keep its
+  marker and leave the text after it empty. That removes the line.
 - A sentence may run across several lines. Punctuate and capitalize as if the
   lines were joined: a line can end without a full stop and the next can start
   in lower case.

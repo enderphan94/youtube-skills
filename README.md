@@ -6,6 +6,9 @@ that gets the subtitles of any YouTube video.
 - **The video has subtitles:** you get them as they are.
 - **The video has only auto-generated captions:** Claude fixes the mis-heard words
   and adds punctuation, then gives you the corrected version.
+- **The video has no captions at all:** the audio is transcribed on your own
+  computer with [Whisper](https://github.com/SYSTRAN/faster-whisper), then
+  corrected by Claude the same way.
 
 Paste a link and ask:
 
@@ -24,6 +27,7 @@ No API key is needed. The Claude you are already chatting with does the correcti
 | *"English subtitles for …"* | The English track, or YouTube's translation if there is none |
 | *"Which subtitle languages does it have?"* | The list of tracks |
 | *"…the raw auto-captions"* | YouTube's captions exactly as they are, uncorrected |
+| *"Transcribe this file"* (an mp4, mp3, m4a, wav…) | The same outputs, from a video or audio file on your computer |
 
 After that, keep talking to Claude: *"summarize it in 5 points"*, *"translate it to
 Vietnamese"*, *"what did he say about passports?"*. Claude answers from the
@@ -32,6 +36,11 @@ transcript, so there is no separate summary command.
 ## Install
 
 You need Python 3.9 or newer. Everything else installs itself on first use.
+
+Videos without captions need a little more, only the first time one comes up: a
+speech model is downloaded (1.6 GB on a computer with 8 or more CPU cores, 0.5 GB
+otherwise), and YouTube downloads need [Node.js 22+](https://nodejs.org) or
+[Deno](https://deno.com) installed.
 
 ### Claude Code (terminal, IDE, and the desktop app's Code tab)
 
@@ -69,24 +78,34 @@ mkdir -p ~/.claude/skills && ln -s ~/youtube-skills/skills/youtube-sub ~/.claude
    `dist/youtube-sub.zip`.
 5. Start a new chat and paste a YouTube link.
 
+The chat sandbox runs on a cloud server, and YouTube usually refuses to send
+audio to those. So for a video with **no captions**, the link alone is not enough
+there: download the video yourself, attach the file to the chat, and ask Claude
+to transcribe it. For that, also allow `huggingface.co` in step 3 (the speech
+model is downloaded from it), or allow all domains. In Claude Code on your own
+computer the link alone works.
+
 ## How it works
 
 ```mermaid
 flowchart TD
     U([You: a YouTube link]) --> F[fetch_transcript.py<br/>lists the video's caption tracks]
-    F --> Q{Human-made subtitles<br/>in the spoken language?}
+    F --> Q{What captions<br/>does it have?}
 
-    Q -- yes --> H[Download them]
-    Q -- "no, only auto-generated" --> A[Download the auto-captions<br/>and split them into parts<br/>of about 8,000 characters]
-    Q -- "no captions at all" --> G[Gemini transcribes the audio<br/>optional, needs GEMINI_API_KEY]
+    Q -- "human-made subtitles" --> H[Download them]
+    Q -- "only auto-generated" --> A[Download the auto-captions]
+    Q -- "none at all" --> D[yt-dlp downloads the audio]
+    L([You: an audio or video file]) --> W
+    D --> W[faster-whisper transcribes it<br/>on your computer]
 
-    A --> C[Claude corrects each part:<br/>mis-heard words, punctuation,<br/>capitals, paragraphs]
+    A --> P[Split into parts<br/>of about 8,000 characters]
+    W --> P
+    P --> C[Claude corrects each part:<br/>mis-heard words, punctuation,<br/>capitals, paragraphs]
     C --> V{apply_corrections.py<br/>checks each part}
     V -- "pass" --> M[Corrected text goes into the file.<br/>For .srt, timing is never touched]
-    V -- "fail: paraphrased, summarized,<br/>wrong language, lost a timestamp" --> K[That part keeps the<br/>original caption text]
+    V -- "fail: paraphrased, summarized,<br/>wrong language, lost a timestamp" --> K[That part keeps the<br/>original text]
 
     H --> O([Your file: .txt, timestamped .txt, .srt or .json])
-    G --> O
     M --> O
     K --> O
     O --> N([Ask Claude anything about it:<br/>summary, notes, translation, quotes])
@@ -97,7 +116,7 @@ The pieces:
 | File | Job |
 |---|---|
 | [`skills/youtube-sub/SKILL.md`](skills/youtube-sub/SKILL.md) | Tells Claude when to use the skill and which steps to follow |
-| [`scripts/fetch_transcript.py`](skills/youtube-sub/scripts/fetch_transcript.py) | Picks the best caption track, downloads and cleans it (`[Music]`, `um`, `uh` removed), writes the file, and reports whether it needs correcting |
+| [`scripts/fetch_transcript.py`](skills/youtube-sub/scripts/fetch_transcript.py) | Picks the best caption track, downloads and cleans it (`[Music]`, `um`, `uh` removed), or transcribes the audio when there are no captions. Writes the file and reports whether it needs correcting |
 | [`references/correction-guide.md`](skills/youtube-sub/references/correction-guide.md) | The rules Claude follows when correcting: fix errors, never rewrite, summarize or translate |
 | [`scripts/apply_corrections.py`](skills/youtube-sub/scripts/apply_corrections.py) | Verifies Claude's corrections and writes the ones that pass into the file |
 
@@ -115,6 +134,15 @@ Design choices worth knowing:
   script fetches the same captions through the hosted
   [YouGist](https://yougist.kuberscan.com) backend, which receives only the
   video URL. Set `YOUGIST_BACKEND=off` to disable this.
+- **Audio transcription is local and never automatic.** It is slow (about a
+  minute per 10 minutes of audio on a fast laptop) and downloads a large model
+  once, so Claude starts it only after the normal fetch reports that the video
+  has no captions. No API key is involved and the audio is deleted afterwards.
+  No ffmpeg is needed either.
+- **Gemini is an optional alternative for caption-less videos.** With
+  `GEMINI_API_KEY` set, Google fetches and transcribes the video itself, so it
+  works from the link alone even where YouTube is blocked. Its output has no
+  per-line timing, so it cannot produce a real `.srt`.
 - **Machine-translated and Gemini transcripts are not corrected.** Their errors
   are not mis-hearings, so the correction rules do not apply to them.
 
@@ -124,7 +152,9 @@ All are environment variables. None is required.
 
 | Variable | What it does |
 |---|---|
-| `GEMINI_API_KEY` | Lets Gemini transcribe videos that have no captions at all. Free key at <https://aistudio.google.com/apikey>. Put it in your shell profile, never in the chat |
+| `WHISPER_MODEL` | Local speech model: `small`, `medium`, `large-v3-turbo` or `large-v3`. Bigger is more accurate and slower. Default: `large-v3-turbo` with 8 or more CPU cores, otherwise `small` |
+| `WHISPER_DEVICE` | `cuda` to use an NVIDIA GPU (default `cpu`) |
+| `GEMINI_API_KEY` | Lets Gemini transcribe caption-less videos instead of the local model. Free key at <https://aistudio.google.com/apikey>. Put it in your shell profile, never in the chat |
 | `GEMINI_MODEL` | Gemini model to use (default `gemini-2.5-flash`) |
 | `YT_PROXY_URL` | `http://user:pass@host:port` proxy for YouTube requests, for when YouTube blocks your IP |
 | `YOUGIST_BACKEND` | Hosted fallback URL, or `off` to never use it |
@@ -136,7 +166,9 @@ All are environment variables. None is required.
 | Problem | Fix |
 |---|---|
 | "YouTube is blocking requests from your IP" | Wait and retry, set `YT_PROXY_URL`, or set `GEMINI_API_KEY` |
-| "This video has no usable captions" | Set `GEMINI_API_KEY` so Gemini can transcribe the audio |
+| The audio download fails with "Sign in to confirm you're not a bot" | YouTube is blocking this network. Download the video yourself and give Claude the file, or set `YT_PROXY_URL` |
+| The audio download fails for another reason | Install Node.js 22+ or Deno, which YouTube downloads need |
+| Audio transcription is too slow or inaccurate | Set `WHISPER_MODEL` to a smaller (`small`) or larger (`large-v3`) model |
 | Wrong language | Ask for the one you want: *"the English subtitles"* |
 | "could not set up the private Python environment" | `python3 -m pip install 'youtube-transcript-api>=1.2'` |
 | `CERTIFICATE_VERIFY_FAILED` on macOS | Run `/Applications/Python\ 3.x/Install\ Certificates.command` |
@@ -160,7 +192,7 @@ python3 skills/youtube-sub/scripts/fetch_transcript.py "https://youtu.be/8jPQjjs
 
 ---
 
-Transcripts come from YouTube's own caption tracks, or from Gemini, and are meant
+Transcripts come from YouTube's own caption tracks, or from speech recognition, and are meant
 for personal use: reading, studying, accessibility, notes. Respect creators'
 rights when sharing them.
 

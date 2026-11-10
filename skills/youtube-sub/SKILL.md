@@ -1,6 +1,6 @@
 ---
 name: youtube-sub
-description: Get the subtitles / transcript of any YouTube video as clean text, timestamped text, an .srt subtitle file or JSON. Use whenever the user shares a YouTube link (watch, youtu.be, Shorts, live, embed, music) or video id and wants its subtitles, captions, transcript, an .srt file or an exact quote, and also whenever they ask to summarize the video, take notes on it, translate it or answer questions about it, because all of that starts from the transcript this skill fetches. Uses the video's own human-made subtitles when it has them. When it only has YouTube's auto-generated captions, Claude corrects the mis-heard words and punctuation itself. Works in any language.
+description: Get the subtitles / transcript of any YouTube video as clean text, timestamped text, an .srt subtitle file or JSON. Use whenever the user shares a YouTube link (watch, youtu.be, Shorts, live, embed, music) or video id and wants its subtitles, captions, transcript, an .srt file or an exact quote, and also whenever they ask to summarize the video, take notes on it, translate it or answer questions about it, because all of that starts from the transcript this skill fetches. Uses the video's own human-made subtitles when it has them. When it only has YouTube's auto-generated captions, Claude corrects the mis-heard words and punctuation itself. When the video has no captions at all, it transcribes the audio on this machine with Whisper. Also transcribes a local audio or video file (mp4, mp3, m4a, wav, webm) the user gives or uploads. Works in any language.
 ---
 
 # YouTube subtitles (`youtube-sub`)
@@ -54,12 +54,15 @@ Where the text comes from, decided by the script:
 3. **Hosted YouGist backend**: only when YouTube blocks this machine. No timestamps.
 4. **Gemini audio transcription**: only when the video has no captions at all and
    `GEMINI_API_KEY` is set. Already punctuated, so no correction.
+5. **Local Whisper transcription of the audio**: never automatic. You start it
+   (section 4) when the video has no captions, or when the user gives a file.
+   The report says `needs_correction: true`, so section 2 applies.
 
 ## 2. Correct auto-generated captions (`needs_correction: true`)
 
 Auto-captions are an unpunctuated stream with mis-heard words. Correct them
 before you hand over the file. Skip this section when the report has no
-`needs_correction`, or when the user only wants a summary or an answer (section 5).
+`needs_correction`, or when the user only wants a summary or an answer (section 6).
 
 1. The report's `parts` lists the files to correct: `<parts_dir>/part-01.txt`,
    `part-02.txt`, … (about 8,000 characters each).
@@ -104,24 +107,57 @@ before you hand over the file. Skip this section when the report has no
   original-language transcript. Say so, and offer to translate it yourself into
   a new file, keeping the meaning exact and adding nothing.
 
-## 4. When it fails (`ok: false`)
+## 4. No captions: transcribe the audio
+
+When the fetch fails with `no_captions` (or `age_restricted`), or the user gives
+a local audio or video file, transcribe the audio on this machine. It needs no
+API key and nothing is uploaded anywhere.
+
+```bash
+python3 "SKILL_DIR/scripts/fetch_transcript.py" "<youtube url>" --source whisper --out-dir "<dir>" [--format …]
+```
+
+```bash
+python3 "SKILL_DIR/scripts/fetch_transcript.py" "<path to the audio or video file>" --out-dir "<dir>" [--format …]
+```
+
+- Before you start, tell the user in one sentence that the video has no captions,
+  so you are transcribing its audio locally, and that this takes a few minutes.
+  The very first run also downloads a speech model (0.5 to 1.6 GB). Do not ask
+  for permission; just say it and start.
+- It is slow: roughly 1 minute per 10 minutes of audio on a fast laptop, far
+  longer on a small machine. Run the command in the background, or with the
+  longest timeout you have, and do not start it twice.
+- All formats work, including real `.srt` timing. Add `--lang zh` (or any code)
+  when the user told you the spoken language; otherwise it is detected.
+- The result is machine transcription, so the report says `needs_correction: true`.
+  Do section 2. Also delete lines Whisper invented over music or silence, such as
+  credits, "thanks for watching" or "subscribe" lines that nobody says: in a
+  marker part, leave that line's text empty after its marker.
+- If the audio download is `blocked` or fails with `network` (normal in the
+  Claude.ai / desktop chat sandbox, which cannot reach YouTube), ask the user to
+  download the video or its audio themselves and attach the file here, then run
+  the second command on that file. If `GEMINI_API_KEY` is set, the normal fetch
+  has already tried Gemini, which needs only the URL.
+
+## 5. When it fails (`ok: false`)
 
 Read `attempts` and `hints`, then tell the user in one or two sentences what
 failed and the concrete fix:
 
-| `kind` | Meaning | What to tell the user |
+| `kind` | Meaning | What to do |
 |---|---|---|
-| `no_captions` | The video has no captions at all | Gemini can transcribe the audio. The user sets `GEMINI_API_KEY` (free key at https://aistudio.google.com/apikey) in their environment, then you run the command again |
-| `blocked`, `network` | YouTube blocks or cannot be reached from this machine (common on cloud, VPN and sandbox IPs) | Set `YT_PROXY_URL`, or set `GEMINI_API_KEY`. In the Claude desktop or web app, allow network access to `youtube.com` (Settings > Capabilities) |
+| `no_captions` | The video has no captions at all | Section 4: transcribe the audio |
+| `blocked`, `network` | YouTube blocks or cannot be reached from this machine (common on cloud, VPN and sandbox IPs) | Tell the user: set `YT_PROXY_URL`, or attach the video file (section 4). In the Claude desktop or web app, allow network access to `youtube.com` (Settings > Capabilities) |
 | `unavailable` | Private, deleted, or not a real video | Nothing can fetch it. Ask for another link |
-| `age_restricted` | YouTube serves captions to signed-in users only | Gemini may still work |
-| `missing_dep` | The caption library could not be installed | `python3 -m pip install 'youtube-transcript-api>=1.2'` |
+| `age_restricted` | YouTube serves this video to signed-in users only | Ask the user to attach the video file (section 4) |
+| `missing_dep` | A Python package could not be installed | Give the user the `pip install` command from the error text |
 
 Never ask the user to paste an API key into the chat. Keys go in their shell
 profile (`export GEMINI_API_KEY=...`), or in Claude Code's `~/.claude/settings.json`
 under `"env"`.
 
-## 5. Summaries, notes, questions, translation
+## 6. Summaries, notes, questions, translation
 
 There is no separate summary command. Once you have the transcript, do whatever
 the user asks with it.
@@ -145,5 +181,6 @@ the user asks with it.
 - Live streams have captions only once the stream has ended and YouTube has
   processed it.
 - Environment switches: `YOUGIST_BACKEND=off` disables the hosted backend,
-  `GEMINI_MODEL` overrides the model (default `gemini-2.5-flash`), and
+  `GEMINI_MODEL` overrides the model (default `gemini-2.5-flash`),
+  `WHISPER_MODEL` picks the local speech model (`small`, `medium`, `large-v3-turbo`, `large-v3`), and
   `YT_PROXY_URL=http://user:pass@host:port` routes YouTube requests through a proxy.

@@ -437,6 +437,88 @@ class Chain(unittest.TestCase):
         self.assertFalse(json.loads(out)["ok"])
 
 
+class LocalWhisper(unittest.TestCase):
+    RESULT = {"source": "whisper", "transcript_type": "auto", "language": None,
+              "language_code": "zh", "translated_to": None, "model": "small", "duration": 6,
+              "segments": [{"start": 0.0, "duration": 2.5, "text": "你好"},
+                           {"start": 3.0, "duration": 3.0, "text": "世界"}]}
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = ft.main(argv)
+        return code, json.loads(out.getvalue())
+
+    def test_local_file_is_transcribed_not_fetched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            media = Path(tmp) / "My Clip.mp4"
+            media.write_bytes(b"x")
+            whisper = mock.Mock(return_value=self.RESULT)
+            with mock.patch.object(ft, "ensure_library", return_value=True), \
+                 mock.patch.object(ft, "fetch_oembed", side_effect=AssertionError("no network for files")), \
+                 mock.patch.object(ft, "fetch_whisper", whisper), \
+                 mock.patch.object(ft.tempfile, "gettempdir", return_value=tmp):
+                code, report = self.run_main([str(media), "--quiet", "--format", "srt", "--out-dir", tmp])
+            self.assertEqual(code, 0)
+            self.assertEqual(whisper.call_args.args[1], media.resolve())
+            self.assertEqual(report["source"], "whisper")
+            self.assertNotIn("url", report)
+            self.assertTrue(report["out"].endswith("my-clip.zh.srt"))
+            self.assertTrue(report["needs_correction"])
+            self.assertIn("1\n00:00:00,000 --> 00:00:02,500\n你好\n", Path(report["out"]).read_text())
+
+    def test_whisper_is_opt_in_and_hinted(self):
+        def no_caps(*a, **k):
+            raise ft.SourceError("no_captions", "Subtitles are disabled for this video")
+
+        whisper = mock.Mock()
+        with mock.patch.object(ft, "ensure_library", return_value=True), \
+             mock.patch.object(ft, "fetch_oembed", return_value={}), \
+             mock.patch.object(ft, "fetch_captions", no_caps), \
+             mock.patch.object(ft, "fetch_whisper", whisper), \
+             mock.patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""}):
+            code, report = self.run_main(["abcdefghijk", "--quiet"])
+        whisper.assert_not_called()
+        self.assertEqual(code, ft.EXIT_NO_TRANSCRIPT)
+        self.assertIn("--source whisper", report["hints"][0])
+
+    def test_blocked_download_suggests_a_file(self):
+        def blocked(*a, **k):
+            raise ft.SourceError("blocked", "yt-dlp: Sign in to confirm you're not a bot")
+
+        with mock.patch.object(ft, "ensure_library", return_value=True), \
+             mock.patch.object(ft, "fetch_oembed", return_value={}), \
+             mock.patch.object(ft, "fetch_whisper", blocked):
+            code, report = self.run_main(["abcdefghijk", "--quiet", "--source", "whisper"])
+        self.assertEqual(code, ft.EXIT_NO_TRANSCRIPT)
+        self.assertTrue(any("file's path" in h for h in report["hints"]))
+
+    def test_ytdlp_errors(self):
+        self.assertEqual(ft._classify_ytdlp("ERROR: Sign in to confirm you’re not a bot"), "blocked")
+        self.assertEqual(ft._classify_ytdlp("ERROR: [youtube] x: Private video"), "unavailable")
+        self.assertEqual(ft._classify_ytdlp("ERROR: Unable to download webpage: timed out"), "network")
+        self.assertEqual(ft._classify_ytdlp("ERROR: something new"), "failed")
+
+    def test_download_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+
+            def fake_run(cmd, **kw):
+                (folder / "audio.webm").write_bytes(b"x")
+                return mock.Mock(returncode=0, stderr="")
+
+            with mock.patch.object(ft, "pip_install"), \
+                 mock.patch.object(ft.shutil, "which", side_effect=lambda n: "/bin/node" if n == "node" else None), \
+                 mock.patch.object(ft.subprocess, "run", side_effect=fake_run) as run, \
+                 mock.patch.dict(os.environ, {"YT_PROXY_URL": ""}):
+                self.assertEqual(ft.download_audio("abcdefghijk", folder), folder / "audio.webm")
+            cmd = run.call_args.args[0]
+            self.assertEqual(cmd[-1], "https://www.youtube.com/watch?v=abcdefghijk")
+            self.assertIn("--no-playlist", cmd)
+            self.assertEqual(cmd[cmd.index("--js-runtimes") + 1], "node")
+            self.assertNotIn("bun", cmd)
+
+
 class Corrections(unittest.TestCase):
     ORIGINAL = ("ngài đã theo đuổi lối tu khổ hạnh và hành xác quá rệt ăn uống ngủ nghỉ "
                 "ngày đã tự hành hạ bản thân mình một cách khắc nghiệt nhưng điều quan trọng là")
@@ -481,6 +563,14 @@ class Corrections(unittest.TestCase):
         ok, why = ac.check(original, "[00:00] Hello world, how are you? I am fine, thank you.")
         self.assertFalse(ok)
         self.assertIn("timestamps", why)
+
+    def test_emptied_cue_is_dropped_and_renumbered(self):
+        srt = ("1\n00:00:00,000 --> 00:00:02,000\nhello there\n\n"
+               "2\n00:00:02,000 --> 00:00:04,000\nthanks for watching\n\n"
+               "3\n00:00:04,000 --> 00:00:06,000\ngoodbye now\n")
+        out = ac.rebuild_srt(srt, ["[1] Hello there.\n[2]\n[3] Goodbye now."])
+        self.assertEqual(out, "1\n00:00:00,000 --> 00:00:02,000\nHello there.\n\n"
+                              "2\n00:00:04,000 --> 00:00:06,000\nGoodbye now.\n")
 
     def apply(self, t):
         out = io.StringIO()

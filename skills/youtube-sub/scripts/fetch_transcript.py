@@ -25,6 +25,14 @@ SOURCE CHAIN  (--source auto, the default)
                clips (default 30 min): Gemini silently truncates and
                hallucinates on long single requests.
 
+LOCAL AUDIO TRANSCRIPTION  (--source whisper, or a local file)
+  Not part of the automatic chain, because it is slow and its first run
+  downloads a speech model (0.5 to 1.6 GB). yt-dlp downloads the video's
+  audio track and faster-whisper transcribes it on this machine: no API key,
+  nothing leaves the computer, and the result has real cue timing. Giving a
+  local audio/video file instead of a URL transcribes that file the same way,
+  which is the way in when this machine cannot reach youtube.com.
+
 OUTPUT
   The transcript goes to --out FILE, into --out-dir DIR (file name built from
   the title), or to stdout. A JSON report of what happened goes to stdout when
@@ -42,6 +50,8 @@ CORRECTION HAND-OFF
 ENVIRONMENT
   GEMINI_API_KEY / GOOGLE_API_KEY   enables the Gemini fallback
   GEMINI_MODEL                      default: gemini-2.5-flash
+  WHISPER_MODEL                     default: large-v3-turbo (8+ CPU cores) or small
+  WHISPER_DEVICE                    default: cpu ("cuda" for an NVIDIA GPU)
   YOUGIST_BACKEND                   hosted backend base URL, or "off"
   YT_PROXY_URL                      http(s) proxy for requests to YouTube
   YT_SKILLS_VENV                    where the private venv lives
@@ -55,9 +65,11 @@ EXIT CODES
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -73,6 +85,11 @@ from pathlib import Path
 __version__ = "2.0.0"
 
 REQUIREMENT = "youtube-transcript-api>=1.2,<2"
+# yt-dlp[default] brings yt-dlp-ejs, which YouTube downloads need since 2025.
+YTDLP_REQUIREMENT = "yt-dlp[default]"
+WHISPER_REQUIREMENT = "faster-whisper>=1.1,<2"
+# Sources whose segments are timed cues (so SRT and [mm:ss] lines are possible).
+CUE_SOURCES = ("captions", "whisper")
 DEFAULT_BACKEND = "https://yougist.kuberscan.com"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_ENDPOINT = (
@@ -125,8 +142,12 @@ def _venv_python(venv: Path) -> Path:
     return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def ensure_library() -> bool:
+def ensure_library(force_venv: bool = False) -> bool:
     """Make youtube-transcript-api importable, bootstrapping a private venv once.
+
+    force_venv: move into the private venv even when the library is already
+    importable, because more packages (yt-dlp, faster-whisper) are about to be
+    installed and they must not land in the user's own Python.
 
     Homebrew and Debian Pythons refuse global pip installs (PEP 668), so rather
     than asking the user to manage packages, the script creates its own venv on
@@ -134,12 +155,14 @@ def ensure_library() -> bool:
     caption source is skipped; the backend and Gemini sources still work
     because they only need the standard library.
     """
-    try:
-        import youtube_transcript_api  # noqa: F401
-        return True
-    except ImportError:
-        pass
-    if os.environ.get("YT_SKILLS_NO_BOOTSTRAP") or os.environ.get("_YT_SKILLS_REEXEC"):
+    settled = os.environ.get("YT_SKILLS_NO_BOOTSTRAP") or os.environ.get("_YT_SKILLS_REEXEC")
+    if settled or not force_venv:
+        try:
+            import youtube_transcript_api  # noqa: F401
+            return True
+        except ImportError:
+            pass
+    if settled:
         return False
 
     venv = _venv_dir()
@@ -922,6 +945,174 @@ def fetch_gemini(video_id, duration, title, lang_hint, clip_minutes: float = 30)
     }
 
 
+# ── source 4: local Whisper (yt-dlp + faster-whisper) ────────────────────────
+
+def pip_install(requirement: str, module: str, upgrade: bool = False) -> None:
+    """Make `module` importable, installing `requirement` next to this Python."""
+    if not upgrade:
+        try:
+            importlib.import_module(module)
+            return
+        except ImportError:
+            pass
+    manual = f"install it with:  {Path(sys.executable).name} -m pip install '{requirement}'"
+    if os.environ.get("YT_SKILLS_NO_BOOTSTRAP"):
+        raise SourceError("missing_dep", f"{module} is not installed; {manual}")
+    log(f"installing {requirement} (one-time)")
+    cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check"]
+    done = subprocess.run(cmd + (["--upgrade"] if upgrade else []) + [requirement],
+                          capture_output=True, text=True)
+    if done.returncode != 0:
+        raise SourceError("missing_dep", f"could not install {requirement} "
+                                         f"({_short(done.stderr, 200)}); {manual}")
+    importlib.invalidate_caches()
+
+
+def _classify_ytdlp(stderr: str) -> str:
+    m = (stderr or "").lower()
+    if "sign in to confirm" in m or "not a bot" in m or "http error 429" in m or "http error 403" in m:
+        return "blocked"
+    if "private video" in m or "video unavailable" in m or "has been removed" in m:
+        return "unavailable"
+    if "confirm your age" in m or "age-restricted" in m:
+        return "age_restricted"
+    if ("unable to download" in m or "timed out" in m or "getaddrinfo" in m
+            or "connection" in m or "tunnel" in m or "name resolution" in m):
+        return "network"
+    return "failed"
+
+
+def download_audio(video_id: str, folder: Path) -> Path:
+    """Download the smallest decent audio-only stream. No ffmpeg involved:
+    the file is decoded later by faster-whisper's bundled PyAV."""
+    pip_install(YTDLP_REQUIREMENT, "yt_dlp")
+    cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--quiet", "--no-warnings",
+           "--no-progress", "-f", "ba[abr>=45]/ba/b", "-S", "+size,+br",
+           "-o", str(folder / "audio.%(ext)s")]
+    # YouTube needs a JavaScript runtime. yt-dlp looks for deno by itself;
+    # node (>= 22) and bun must be switched on explicitly.
+    for runtime in ("node", "bun"):
+        if shutil.which(runtime):
+            cmd += ["--js-runtimes", runtime]
+    if yt_proxy():
+        cmd += ["--proxy", yt_proxy()]
+    cmd.append(watch_url(video_id))
+
+    done = None
+    for attempt in range(2):
+        log("downloading the audio track with yt-dlp")
+        try:
+            done = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        except subprocess.TimeoutExpired:
+            raise SourceError("network", "yt-dlp: the audio download timed out") from None
+        files = [f for f in folder.glob("audio.*") if f.suffix != ".part"]
+        if done.returncode == 0 and files:
+            return files[0]
+        kind = _classify_ytdlp(done.stderr)
+        if kind != "failed" or attempt:
+            break
+        # YouTube changes often and an old yt-dlp is the usual cause: update once.
+        pip_install(YTDLP_REQUIREMENT, "yt_dlp", upgrade=True)
+    raise SourceError(_classify_ytdlp(done.stderr),
+                      f"yt-dlp: {_short(done.stderr or 'no audio file was produced')}")
+
+
+def whisper_model_name() -> str:
+    name = os.environ.get("WHISPER_MODEL", "").strip()
+    if name:
+        return name
+    # Turbo is far more accurate (small mis-hears many names and, in Chinese,
+    # homophones) but needs a capable CPU to be bearable.
+    return "large-v3-turbo" if (os.cpu_count() or 1) >= 8 else "small"
+
+
+def decode_audio(path: Path):
+    """Any audio/video file -> the 16 kHz mono float32 array Whisper wants.
+
+    Done here, with the PyAV that faster-whisper ships with, instead of letting
+    faster-whisper open the file: its own decoder passes av.open() an argument
+    that newer PyAV releases reject ("unexpected keyword 'metadata_errors'").
+    Also means no ffmpeg install is needed.
+    """
+    import av
+    import numpy as np
+
+    resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=16000)
+    chunks = []
+    with av.open(str(path), mode="r") as container:
+        if not container.streams.audio:
+            raise SourceError("failed", f"{path.name} has no audio track")
+        for packet in container.demux(container.streams.audio[0]):
+            try:
+                frames = packet.decode()
+            except av.error.InvalidDataError:
+                continue  # a damaged packet: skip it, keep the rest
+            for frame in frames:
+                chunks += [out.to_ndarray().reshape(-1) for out in resampler.resample(frame)]
+        chunks += [out.to_ndarray().reshape(-1) for out in resampler.resample(None)]
+    if not chunks:
+        raise SourceError("failed", f"no audio could be decoded from {path.name}")
+    return np.concatenate(chunks).astype(np.float32) / 32768.0
+
+
+def transcribe_audio(path: Path, lang_hint: str = "") -> dict:
+    pip_install(WHISPER_REQUIREMENT, "faster_whisper")
+    from faster_whisper import WhisperModel
+
+    name = whisper_model_name()
+    device = os.environ.get("WHISPER_DEVICE", "").strip() or "cpu"
+    try:
+        audio = decode_audio(path)
+        log(f"whisper: loading model '{name}' (the first use downloads it)")
+        model = WhisperModel(name, device=device,
+                             compute_type="int8" if device == "cpu" else "float16",
+                             cpu_threads=min(8, os.cpu_count() or 4))
+        # vad_filter off: it drops singing and can collapse a music-heavy video
+        # into one cue. condition_on_previous_text off: one mis-heard segment
+        # otherwise cascades into repetition loops.
+        cues, info = model.transcribe(
+            audio, language=_base_lang(lang_hint) or None, beam_size=5,
+            vad_filter=False, condition_on_previous_text=False,
+        )
+        total, segments, next_mark = float(info.duration or 0), [], 10
+        log(f"whisper: {fmt_ts(total)} of audio, language '{info.language}'")
+        for cue in cues:  # a generator: the work happens here
+            text = (cue.text or "").strip()
+            if text:
+                segments.append({"start": float(cue.start),
+                                 "duration": max(0.0, float(cue.end - cue.start)), "text": text})
+            while total and cue.end / total * 100 >= next_mark:
+                log(f"whisper: {next_mark}%")
+                next_mark += 10
+    except SourceError:
+        raise
+    except Exception as e:
+        kind = "network" if "huggingface" in str(e).lower() or isinstance(e, OSError) else "failed"
+        raise SourceError(kind, f"whisper: {_short(e)}") from None
+    if not segments:
+        raise SourceError("failed", "whisper: no speech was recognized in the audio")
+    return {
+        "source": "whisper",
+        "transcript_type": "auto",
+        "language": None,
+        "language_code": info.language,
+        "translated_to": None,
+        "segments": segments,
+        "model": name,
+        "duration": int(total) or None,
+    }
+
+
+def fetch_whisper(video_id: str, local_file=None, lang_hint: str = "") -> dict:
+    if local_file:
+        return transcribe_audio(local_file, lang_hint)
+    folder = Path(tempfile.mkdtemp(prefix=f"youtube-sub-audio-{video_id}-"))
+    try:
+        return transcribe_audio(download_audio(video_id, folder), lang_hint)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 # ── rendering ─────────────────────────────────────────────────────────────────
 
 def fmt_srt_time(seconds: float) -> str:
@@ -953,7 +1144,7 @@ def group_cues(segments, seconds: float = 30, max_chars: int = 600) -> list:
 
 
 def render_text(result) -> str:
-    if result["source"] == "captions":
+    if result["source"] in CUE_SOURCES:
         text = clean_snippets(result["segments"])
     elif result["source"] == "gemini":
         text = "\n\n".join(clean_prose(s["text"]) for s in result["segments"])
@@ -964,7 +1155,7 @@ def render_text(result) -> str:
 
 def render_timestamped(result, group_seconds: float, long_ts: bool) -> str:
     lines = []
-    if result["source"] == "captions":
+    if result["source"] in CUE_SOURCES:
         for g in group_cues(result["segments"], group_seconds):
             lines.append(f"[{fmt_ts(g['start'], long_ts)}] {g['text']}")
         return "\n".join(lines)
@@ -1006,7 +1197,9 @@ def render_cue_lines(segments) -> str:
 
 
 def correction_dir(video_id: str, fmt: str) -> Path:
-    return Path(tempfile.gettempdir()) / "youtube-sub" / f"{video_id}-{fmt}"
+    # A fresh private (0700) folder per run. A predictable name in a shared
+    # /tmp would let another local user pre-plant symlinks or "corrected" parts.
+    return Path(tempfile.mkdtemp(prefix=f"youtube-sub-{video_id}-{fmt}-"))
 
 
 def write_parts(folder: Path, text: str) -> list:
@@ -1033,6 +1226,9 @@ def source_detail(result) -> str:
         return detail
     if src == "backend":
         return f"YouTube captions via the hosted YouGist backend ({result['transcript_type']})"
+    if src == "whisper":
+        return (f"Whisper transcription of the audio, run locally "
+                f"({result.get('model')}, language '{result.get('language_code')}'), no captions used")
     return f"Gemini audio transcription ({result.get('model', DEFAULT_GEMINI_MODEL)}), no captions used"
 
 
@@ -1042,7 +1238,10 @@ def build_header(meta: dict) -> str:
         rows.append(("Title", meta["title"]))
     if meta.get("channel"):
         rows.append(("Channel", meta["channel"]))
-    rows.append(("URL", meta["url"]))
+    if meta.get("url"):
+        rows.append(("URL", meta["url"]))
+    if meta.get("file"):
+        rows.append(("File", meta["file"]))
     if meta.get("duration"):
         rows.append(("Duration", meta["duration"]))
     rows.append(("Source", meta["source_detail"]))
@@ -1073,10 +1272,23 @@ def failure_hints(attempts) -> list:
             "residential proxy, or set GEMINI_API_KEY. In the Claude desktop/web "
             "app, allow network access to youtube.com (Settings > Capabilities)."
         )
+    tried = {a.get("source") for a in attempts}
+    if "whisper" not in tried and kinds & {"no_captions", "age_restricted", "failed", "unplayable"}:
+        hints.append(
+            "No usable captions. Run again with --source whisper to transcribe the "
+            "audio on this machine: no API key, but it is slow and the first run "
+            "downloads a speech model (0.5 to 1.6 GB)."
+        )
+    if "whisper" in tried and kinds & {"blocked", "network"}:
+        hints.append(
+            "The audio could not be downloaded here. Download the video or its audio "
+            "on a machine that can reach YouTube, then pass that file's path instead "
+            "of the URL to transcribe it locally."
+        )
     if "no_captions" in kinds and not gemini_key():
         hints.append(
-            "This video has no usable captions. Set GEMINI_API_KEY (free at "
-            "https://aistudio.google.com/apikey) to transcribe the audio with Gemini."
+            "Alternatively set GEMINI_API_KEY (free at https://aistudio.google.com/apikey) "
+            "to transcribe the audio with Gemini."
         )
     if "missing_dep" in kinds:
         hints.append(f"Install the caption library:  python3 -m pip install '{REQUIREMENT}'")
@@ -1092,7 +1304,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Fetch the full transcript of a YouTube video (captions, with a Gemini fallback).",
     )
-    ap.add_argument("video", help="YouTube URL (watch, youtu.be, shorts, live, embed) or 11-char video id")
+    ap.add_argument("video", help="YouTube URL (watch, youtu.be, shorts, live, embed), 11-char video id, "
+                                  "or the path of a local audio/video file to transcribe")
     ap.add_argument("--lang", default="",
                     help="preferred caption languages, comma-separated, best first (e.g. 'en,vi')")
     ap.add_argument("--translate", default="", metavar="LANG",
@@ -1105,7 +1318,8 @@ def main(argv=None) -> int:
     ap.add_argument("--no-header", action="store_true", help="omit the Title/URL/Source header")
     ap.add_argument("--raw", action="store_true",
                     help="keep auto-generated captions as they are: do not prepare parts for correction")
-    ap.add_argument("--source", choices=["auto", "captions", "backend", "gemini"], default="auto")
+    ap.add_argument("--source", choices=["auto", "captions", "backend", "gemini", "whisper"], default="auto",
+                    help="whisper = download the audio and transcribe it on this machine")
     ap.add_argument("--no-backend", action="store_true", help="never use the hosted YouGist backend")
     ap.add_argument("--no-gemini", action="store_true", help="never use Gemini")
     ap.add_argument("--gemini-clip-minutes", type=float, default=30)
@@ -1115,10 +1329,14 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     QUIET = args.quiet
 
-    video_id = extract_video_id(args.video)
-    if not video_id:
-        print(json.dumps({"ok": False, "error": f"Not a YouTube video URL or id: {args.video!r}"}))
+    local_file = Path(args.video).expanduser()
+    local_file = local_file.resolve() if local_file.is_file() else None
+    video_id = "" if local_file else extract_video_id(args.video)
+    if (not local_file and not video_id) or (local_file and args.list_tracks):
+        print(json.dumps({"ok": False, "error": "Not a YouTube video URL or id, nor an existing "
+                                                f"audio/video file: {args.video!r}"}))
         return EXIT_USAGE
+    url = None if local_file else watch_url(video_id)
     prefs = [p.strip() for p in args.lang.split(",") if p.strip()]
 
     order = {"auto": ["captions", "backend", "gemini"]}.get(args.source, [args.source])
@@ -1129,8 +1347,12 @@ def main(argv=None) -> int:
             order.remove("gemini")
     if args.list_tracks:
         order = ["captions"]
+    if local_file:
+        order = ["whisper"]
 
-    have_lib = ensure_library() if "captions" in order else False
+    have_lib = False
+    if "captions" in order or "whisper" in order:
+        have_lib = ensure_library(force_venv="whisper" in order)
 
     if args.list_tracks:
         if not have_lib:
@@ -1153,7 +1375,7 @@ def main(argv=None) -> int:
         }, ensure_ascii=False, indent=2))
         return EXIT_OK
 
-    meta_web = fetch_oembed(video_id)
+    meta_web = {"title": local_file.stem} if local_file else fetch_oembed(video_id)
     attempts, result, captions_kind = [], None, None
     for src in order:
         if src == "backend" and captions_kind in ("no_captions", "age_restricted", "unavailable"):
@@ -1168,6 +1390,8 @@ def main(argv=None) -> int:
                 result = fetch_captions(video_id, prefs, args.translate)
             elif src == "backend":
                 result = fetch_backend(video_id)
+            elif src == "whisper":
+                result = fetch_whisper(video_id, local_file, prefs[0] if prefs else "")
             else:
                 result = fetch_gemini(video_id, None, meta_web.get("title"),
                                       prefs[0] if prefs else "", args.gemini_clip_minutes)
@@ -1185,8 +1409,8 @@ def main(argv=None) -> int:
         unavailable = any(a.get("kind") == "unavailable" for a in attempts)
         print(json.dumps({
             "ok": False,
-            "video_id": video_id,
-            "url": watch_url(video_id),
+            "video_id": video_id or None,
+            "url": url,
             "title": meta_web.get("title"),
             "error": "Video unavailable" if unavailable else "No transcript could be obtained",
             "attempts": attempts,
@@ -1197,7 +1421,7 @@ def main(argv=None) -> int:
     warnings = list(result.get("warnings") or [])
     segments = result.get("segments")
     duration = result.get("duration")
-    if result["source"] == "captions" and segments:
+    if result["source"] in CUE_SOURCES and segments:
         duration = int(max(s["start"] + s["duration"] for s in segments))
     long_ts = bool(duration and duration >= 3600)
 
@@ -1212,8 +1436,9 @@ def main(argv=None) -> int:
         warnings.append(f"Gemini timestamps mark clip starts only (every {args.gemini_clip_minutes:g} min).")
 
     meta = {
-        "video_id": video_id,
-        "url": watch_url(video_id),
+        "video_id": video_id or None,
+        "url": url,
+        "file": str(local_file) if local_file else None,
         "title": meta_web.get("title"),
         "channel": meta_web.get("channel"),
         "duration_seconds": duration,
@@ -1237,7 +1462,7 @@ def main(argv=None) -> int:
     else:
         body = render_text(result)
         clean_segments = None
-        if result["source"] == "captions":
+        if result["source"] in CUE_SOURCES:
             clean_segments = [
                 {"start": round(s["start"], 3), "duration": round(s["duration"], 3),
                  "text": strip_fillers(clean_cue(s["text"]))}
@@ -1264,7 +1489,7 @@ def main(argv=None) -> int:
         out_path = Path(args.out).expanduser()
     elif args.out_dir:
         stem = slugify(meta.get("title") or "")
-        stem = f"{stem}-{video_id}" if stem else video_id
+        stem = "-".join(x for x in (stem, video_id) if x) or "transcript"
         ext = {"text": ".txt", "timestamped": ".timestamped.txt", "json": ".json"}.get(fmt)
         if fmt == "srt":
             code = result.get("translated_to") or result.get("language_code")
@@ -1276,7 +1501,7 @@ def main(argv=None) -> int:
     parts, parts_dir = [], None
     if (out_path and not args.raw and fmt != "json"
             and result["transcript_type"] == "auto" and not result.get("translated_to")):
-        parts_dir = correction_dir(video_id, fmt)
+        parts_dir = correction_dir(video_id or "file", fmt)
         parts = write_parts(parts_dir, render_cue_lines(segments) if fmt == "srt" else body)
 
     plain = render_text(result) if fmt != "text" else body

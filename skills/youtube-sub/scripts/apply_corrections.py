@@ -114,18 +114,25 @@ def split_header(document: str):
 
 
 def rebuild_srt(srt: str, sections: list) -> str:
-    """Put corrected "[N] text" lines back into cue N; timing is untouched."""
+    """Put corrected "[N] text" lines back into cue N; timing is untouched.
+
+    A marker left with no text means "nobody said this" (a line the speech
+    recognizer invented over music): that cue is dropped and the rest renumbered.
+    """
     texts = {}
     for section in sections:
         for line in section.splitlines():
             m = re.match(r"^\[(\d+)\]\s*(.*)$", line.strip())
-            if m and m.group(2).strip():
+            if m:
                 texts[m.group(1)] = m.group(2).strip()
     blocks = []
     for block in re.split(r"\n\s*\n", srt.strip()):
         lines = block.splitlines()
-        if len(lines) >= 3 and lines[0].strip() in texts:
-            lines = lines[:2] + [texts[lines[0].strip()]]
+        if len(lines) >= 3:
+            text = texts.get(lines[0].strip(), "\n".join(lines[2:]))
+            if not text:
+                continue
+            lines = [str(len(blocks) + 1), lines[1], text]
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks) + "\n"
 
@@ -168,6 +175,8 @@ def main(argv=None) -> int:
             # Timestamped parts are lines, plain-text parts are paragraphs.
             joiner = "\n" if MARKER_RE.search(sections[0]) else "\n\n"
             body = joiner.join(sections).strip()
+            # A [mm:ss] marker left with no text is a deleted (invented) line.
+            body = re.sub(r"^\[[\d:]+\][ \t]*\n?", "", body, flags=re.MULTILINE)
             document = ("\n".join(header) + "\n\n" if header else "") + body + "\n"
         out.write_text(document, encoding="utf-8")
 
