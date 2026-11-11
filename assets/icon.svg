@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="t d">
+  <title id="t">youtube-sub</title>
+  <desc id="d">A video frame with a play mark and two subtitle lines, the second one checked.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1B2033"/>
+      <stop offset="1" stop-color="#0E111C"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- video frame -->
+  <rect x="76" y="100" width="360" height="312" rx="52" fill="none" stroke="#F4F6FB" stroke-width="22"/>
+  <!-- play mark -->
+  <path d="M226 168 L226 244 L292 206 Z" fill="#F4F6FB" stroke="#F4F6FB" stroke-width="14" stroke-linejoin="round"/>
+  <!-- subtitle lines: as heard, then verified -->
+  <rect x="128" y="290" width="256" height="26" rx="13" fill="#F4F6FB"/>
+  <rect x="128" y="338" width="150" height="26" rx="13" fill="#3DDC97"/>
+  <path d="M316 354 L337 373 L376 336" fill="none" stroke="#3DDC97" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

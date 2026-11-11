@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon.svg" width="120" height="120" alt="youtube-sub icon: a video frame with two subtitle lines, the second one checked">
+</p>
+
 # youtube-skills
 
 A [Claude skill](https://docs.claude.com/en/docs/agents-and-tools/agent-skills/overview)
