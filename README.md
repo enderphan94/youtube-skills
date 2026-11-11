@@ -175,6 +175,11 @@ Design choices worth knowing:
 - **Machine-translated and Gemini transcripts are not corrected.** Their errors
   are not mis-hearings, so the correction rules do not apply to them.
 
+**Want the full technical design?** Read the research paper:
+[Verified transcripts from any YouTube video: the design of the youtube-sub skill](https://kuberscan.com/research/verified-transcripts-from-any-youtube-video-the-design-of-the-youtube-sub-skill).
+It covers the architecture, where each technique came from, how the checks
+work, and the known limitations.
+
 ## Optional settings
 
 All are environment variables. None is required.
