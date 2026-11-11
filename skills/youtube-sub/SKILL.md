@@ -46,7 +46,7 @@ unless the report says that step failed.
 
 The script prints a JSON report. The fields that matter: `ok`, `out`, `title`,
 `duration`, `source_detail`, `words`, `needs_correction`, `parts_dir`, `parts`,
-`available_tracks`, `warnings`, `attempts` and `hints`.
+`speech_check`, `available_tracks`, `warnings`, `attempts` and `hints`.
 
 Where the text comes from, decided by the script:
 
@@ -86,6 +86,16 @@ before you hand over the file. Skip this section when the report has no
 5. Read the result: `accepted` of `parts`. If `kept_original` lists a part, fix
    that part once more and run the command again. Tell the user about any part
    that still keeps the raw caption text.
+6. `deletions_refused` lists lines you emptied that the script put back, because
+   a voice is heard in that stretch of audio. Do not try to delete them again.
+   Real speech may be hidden under such a line, so tell the user its time range.
+
+**Never remove speech on your own judgment.** You cannot hear the audio. A line
+that reads like an invented credit can sit on top of real dialogue. Removing a
+line is only ever a proposal (an emptied marker line), and the script decides.
+In a plain-text part, which has no markers, remove a line only when it is listed
+in the fetch report's `speech_check.no_voice_lines` and is clearly not part of
+the video.
 
 ## 3. Tell the user
 
@@ -96,6 +106,8 @@ before you hand over the file. Skip this section when the report has no
   and rare terms may still be wrong); Gemini's AI transcription of the audio;
   or YouTube's machine translation.
 - Every entry in `warnings`, in plain words, especially possible truncation.
+- Everything in section 7 that applies: lines removed, speech recovered, and
+  time ranges that need the user's ear.
 - **Short text transcripts** (up to about 1,500 words): you may paste the full text
   in the reply when the user wants to read it here. **Longer ones**: quote the first
   sentence or two as a preview and point to the file. The file is the deliverable.
@@ -132,9 +144,13 @@ python3 "SKILL_DIR/scripts/fetch_transcript.py" "<path to the audio or video fil
 - All formats work, including real `.srt` timing. Add `--lang zh` (or any code)
   when the user told you the spoken language; otherwise it is detected.
 - The result is machine transcription, so the report says `needs_correction: true`.
-  Do section 2. Also delete lines Whisper invented over music or silence, such as
-  credits, "thanks for watching" or "subscribe" lines that nobody says: in a
-  marker part, leave that line's text empty after its marker.
+  Do section 2.
+- Whisper invents lines over music or silence: credits, "thanks for watching",
+  "subscribe". An invented line can also swallow real speech next to it. The
+  script already checks for this (`speech_check` in the report): it finds where
+  a voice is heard, transcribes suspicious stretches a second time, and removes
+  an invented line only where nothing else is there. If you still see an
+  invented line, propose its removal as section 2 describes. Never just drop it.
 - If the audio download is `blocked` or fails with `network` (normal in the
   Claude.ai / desktop chat sandbox, which cannot reach YouTube), ask the user to
   download the video or its audio themselves and attach the file here, then run
@@ -173,6 +189,33 @@ the user asks with it.
   instead of guessing what the video contains.
 - Answer in the language the user wrote in, whatever language the video is in.
 - When names or terms come from auto-generated captions, say they may be mis-heard.
+
+## 7. Before you call it final
+
+Run through this every time, after the last script has run. The scripts do the
+checking; your job is to read their reports and pass them on honestly.
+
+1. **Fetch report, `speech_check`** (audio transcriptions only):
+   - `status: "pass"`: every stretch where a voice was detected has text, or
+     was checked a second time.
+   - `status: "review"`: `review` lists time ranges where a voice was detected
+     but no words were recognized. The transcript may be missing speech there.
+     Give the user every range and say what it means. Do not call the
+     transcript complete.
+   - `status: "not_run"`: the check could not run. Say that missing speech
+     would not have been noticed.
+   - `recovered`: speech the first pass skipped or hid under an invented line,
+     found on a second pass. Mention it with its time range.
+   - `removed`: invented lines that were taken out. List each with its time
+     range and text, so the user can object.
+2. **`apply_corrections.py` report**: `status` must be `"pass"`. On `"review"`,
+   report every `kept_original` part and every `deletions_refused` line.
+   `removed_lines` are lines you proposed removing and the script allowed:
+   list them too.
+3. **If the user says something is missing**, believe them. Transcribe that
+   stretch again from the file (cut the audio from a few seconds before the
+   missing part) instead of defending the first result.
+4. Only then give the file to the user, with section 3's details.
 
 ## Notes
 

@@ -60,7 +60,12 @@ video, so:
   another, and do not add paragraph breaks.
 - The one exception: a line the recognizer invented over music or silence, which
   nobody actually says (a credit, "thanks for watching", "subscribe"). Keep its
-  marker and leave the text after it empty. That removes the line.
+  marker and leave the text after it empty. That **proposes** removing the line.
+  You cannot hear the audio, so the script decides: it removes the line only
+  when no voice was detected in that stretch, and puts the original text back
+  otherwise, because real speech may be hidden under an invented line.
+- In a plain-text part (no markers), do not remove sentences, even ones that
+  look invented, unless your instructions name the exact lines you may remove.
 - A sentence may run across several lines. Punctuate and capitalize as if the
   lines were joined: a line can end without a full stop and the next can start
   in lower case.
@@ -70,7 +75,9 @@ video, so:
 `apply_corrections.py` rejects a part, keeping the original captions, when a
 marker changed, when it uses a writing system the original doesn't, when its
 length changes by more than 2x, or when more than 30% of the words change.
-Rewriting freely therefore loses the part entirely.
+Rewriting freely therefore loses the part entirely. Emptied marker lines are
+not counted against those limits; each one is checked against the audio's
+speech map instead.
 
 ## Vietnamese, and Southern accents in particular
 

@@ -607,5 +607,148 @@ class Corrections(unittest.TestCase):
             self.assertEqual((t / "talk.txt").read_text(), "Title:    X\n\nhello world\n")
 
 
+def seg(start, end, text):
+    return {"start": float(start), "duration": float(end - start), "text": text}
+
+
+class SpeechCheck(unittest.TestCase):
+    """The reported incident: an invented line stamped over 0:00-0:30 hid the
+    dialogue at 0:20-0:30, and correction then deleted it without a trace."""
+
+    STOCK = "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目"
+    FIRST = [seg(0, 29.98, STOCK), seg(30, 33.12, "哥前前后后耽误了多少好日子"), seg(33.12, 34.38, "这下半辈子")]
+    SPEECH = [(20.5, 34.4)]
+
+    def test_stock_phrases(self):
+        self.assertTrue(ft.is_stock_phrase(self.STOCK))
+        self.assertTrue(ft.is_stock_phrase("請不吝點贊訂閱轉發打賞支持明鏡與點點欄目"))
+        self.assertTrue(ft.is_stock_phrase("Thanks for watching!"))
+        self.assertTrue(ft.is_stock_phrase("Subtitles by the Amara.org community"))
+        self.assertTrue(ft.is_stock_phrase("中文字幕——YK"))
+        self.assertFalse(ft.is_stock_phrase("Thanks for watching the kids yesterday"))
+        self.assertFalse(ft.is_stock_phrase("哥前前后后耽误了多少好日子"))
+        self.assertFalse(ft.is_stock_phrase("..."))
+
+    def test_uncovered_speech(self):
+        self.assertEqual(ft.uncovered_speech([(0, 10)], [(0, 4), (7, 10)], 1.5), [(4, 7)])
+        self.assertEqual(ft.uncovered_speech([(0, 10)], [(0, 4), (5, 10)], 1.5), [])
+        self.assertEqual(ft.uncovered_speech([(0, 3), (20, 30)], [], 1.5), [(0, 3), (20, 30)])
+
+    def test_swallowed_speech_is_recovered(self):
+        calls = []
+
+        def redecode(lo, hi):
+            calls.append((lo, hi))
+            return [seg(20.56, 24.2, "你看啥呀?傻了?没傻。"), seg(24.66, 30.22, "老刘,你看这两棵树")]
+
+        out, check = ft.guard_segments([dict(s) for s in self.FIRST], self.SPEECH, redecode)
+        self.assertEqual(calls, [(19.5, 30.98)])  # from the speech onset, not from 0:00
+        self.assertEqual([s["text"] for s in out][:2], ["你看啥呀?傻了?没傻。", "老刘,你看这两棵树"])
+        self.assertNotIn(self.STOCK, [s["text"] for s in out])
+        self.assertEqual(len(out), 4)
+        self.assertEqual(check["status"], "pass")
+        self.assertEqual(check["recovered"][0]["replaced"], self.STOCK)
+
+    def test_stock_line_over_silence_is_removed_and_reported(self):
+        first = [seg(0, 2, "Thanks for watching!"), seg(20.5, 24, "hello there my friend")]
+        out, check = ft.guard_segments(first, [(20.5, 24)], lambda lo, hi: self.fail("no re-decode needed"))
+        self.assertEqual([s["text"] for s in out], ["hello there my friend"])
+        self.assertEqual(check["removed"][0]["text"], "Thanks for watching!")
+        self.assertEqual(check["status"], "pass")
+
+    def test_long_stock_line_is_decoded_again_even_without_a_voice(self):
+        # The detector misses speech over music, so "no voice" is not trusted for a long line.
+        first = [seg(0, 20, "Thanks for watching!"), seg(20.5, 24, "hello there my friend")]
+        out, check = ft.guard_segments([dict(s) for s in first], [(20.5, 24)],
+                                       lambda lo, hi: [seg(12, 18, "words spoken over the music")])
+        self.assertEqual([s["text"] for s in out], ["words spoken over the music", "hello there my friend"])
+        # Text that changes with every decode is invented too, not recovered speech.
+        takes = iter([[seg(3, 16, "some other invented credit")], [seg(3, 16, "yet another different thing")]])
+        out, check = ft.guard_segments([dict(s) for s in first], [(20.5, 24)], lambda lo, hi: next(takes))
+        self.assertEqual([s["text"] for s in out], ["hello there my friend"])
+        self.assertNotIn("recovered", check)
+        out, check = ft.guard_segments([dict(s) for s in first], [(20.5, 24)],
+                                       lambda lo, hi: [seg(0, 19, "Thank you for watching.")])
+        self.assertEqual([s["text"] for s in out], ["hello there my friend"])
+        self.assertEqual(len(check["removed"]), 1)
+
+    def test_stock_line_that_is_really_said_stays(self):
+        first = [seg(0, 4, "hello there my friend"), seg(4, 6, "Thanks for watching!")]
+        out, check = ft.guard_segments(first, [(0, 6)], lambda lo, hi: [seg(4.1, 5.8, "Thanks for watching.")])
+        self.assertEqual(len(out), 2)
+        self.assertNotIn("removed", check)
+
+    def test_unrecognized_speech_asks_for_review(self):
+        first = [seg(0, 29.98, self.STOCK)]
+        out, check = ft.guard_segments(first, [(20.5, 30.4)], lambda lo, hi: [])
+        self.assertEqual(out, [])
+        self.assertEqual(check["status"], "review")
+        self.assertEqual(check["review"][0]["at"], "00:20-00:30")
+
+    def test_skipped_speech_gets_its_own_pass(self):
+        first = [seg(0, 4, "hello there my friend"), seg(20, 24, "and goodbye for now")]
+        speech = [(0, 4), (8, 14), (20, 24)]
+        out, check = ft.guard_segments(first, speech, lambda lo, hi: [seg(8.2, 13.5, "this part was skipped")])
+        self.assertEqual([s["text"] for s in out][1], "this part was skipped")
+        self.assertEqual(check["recovered"][0]["reason"], "speech that the first pass skipped")
+        # ...but words the neighbours already have are not added twice.
+        out, check = ft.guard_segments(first, speech, lambda lo, hi: [seg(8.2, 13.5, "Hello there, my friend.")])
+        self.assertEqual(len(out), 2)
+        self.assertEqual(check["status"], "review")
+
+    def test_normal_transcript_is_untouched(self):
+        first = [seg(0, 4, "hello there my friend"), seg(4, 8, "how are you doing today")]
+        out, check = ft.guard_segments(first, [(0, 8)], lambda lo, hi: self.fail("nothing is suspicious"))
+        self.assertEqual(out, first)
+        self.assertEqual(check, {"status": "pass", "speech_seconds": 8.0})
+
+    def test_cue_without_voice_is_listed(self):
+        first = [seg(0, 4, "hello there my friend"), seg(60, 63, "Zither Harp")]
+        out, check = ft.guard_segments(first, [(0, 4)], lambda lo, hi: [])
+        self.assertEqual(len(out), 2)  # kept: only the correction step may propose removing it
+        self.assertEqual(check["no_voice_lines"], [{"at": "01:00-01:03", "text": "Zither Harp"}])
+
+    def test_marker_spans(self):
+        segs = [seg(0, 29.98, "a"), seg(30, 33, "b")]
+        self.assertEqual(ft.marker_spans(segs, "srt", 30, False), {"1": [0.0, 29.98], "2": [30.0, 33.0]})
+        self.assertEqual(ft.marker_spans(segs, "timestamped", 30, False), {"00:00": [0.0, 30.0], "00:30": [30.0, 33.0]})
+        self.assertEqual(ft.marker_spans(segs, "text", 30, False), {})
+
+    def deletion(self, speech):
+        """Claude empties cue 1 of the incident's first-pass SRT."""
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            (t / "parts" / "corrected").mkdir(parents=True)
+            (t / "parts" / "part-01.txt").write_text(f"[1] {self.STOCK}\n[2] 哥前前后后耽误了多少好日子\n[3] 这下半辈子\n")
+            (t / "parts" / "corrected" / "part-01.txt").write_text("[1]\n[2] 哥前前后后耽误了多少好日子\n[3] 这下半辈子\n")
+            if speech is not None:
+                ft.write_speech_map(t / "parts", speech, ft.marker_spans(self.FIRST, "srt", 30, False))
+            (t / "a.srt").write_text(ft.render_srt(self.FIRST))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ac.main(["--parts-dir", str(t / "parts"), "--out", str(t / "a.srt")])
+            return json.loads(out.getvalue()), (t / "a.srt").read_text()
+
+    def test_deleting_a_line_over_speech_is_refused(self):
+        report, srt = self.deletion(self.SPEECH)
+        self.assertEqual(report["status"], "review")
+        self.assertEqual(report["deletions_refused"][0]["line"], "[1]")
+        self.assertIn("9.5 s", report["deletions_refused"][0]["reason"])
+        self.assertIn(self.STOCK, srt)  # the line stays, so the hole stays visible
+        self.assertEqual(srt.count(" --> "), 3)
+
+    def test_deleting_a_line_over_silence_is_allowed(self):
+        report, srt = self.deletion([(30.0, 34.4)])
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["removed_lines"], [{"line": "[1]", "text": self.STOCK}])
+        self.assertNotIn(self.STOCK, srt)
+        self.assertTrue(srt.startswith("1\n00:00:30,000"))
+
+    def test_deleting_without_a_speech_map_is_refused(self):
+        report, srt = self.deletion(None)
+        self.assertEqual(report["status"], "review")
+        self.assertIn(self.STOCK, srt)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

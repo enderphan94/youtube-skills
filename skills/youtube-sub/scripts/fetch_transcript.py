@@ -32,6 +32,10 @@ LOCAL AUDIO TRANSCRIPTION  (--source whisper, or a local file)
   nothing leaves the computer, and the result has real cue timing. Giving a
   local audio/video file instead of a URL transcribes that file the same way,
   which is the way in when this machine cannot reach youtube.com.
+  The result is then checked against a map of where a voice is heard (Silero
+  VAD): suspicious cues and speech with no cue are decoded a second time, so
+  an invented line cannot hide real speech. The report's "speech_check" lists
+  what was recovered, what was removed, and what a person should listen to.
 
 OUTPUT
   The transcript goes to --out FILE, into --out-dir DIR (file name built from
@@ -81,9 +85,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from difflib import SequenceMatcher
 from pathlib import Path
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 REQUIREMENT = "youtube-transcript-api>=1.2,<2"
 # yt-dlp[default] brings yt-dlp-ejs, which YouTube downloads need since 2025.
@@ -1056,35 +1061,319 @@ def decode_audio(path: Path):
     return np.concatenate(chunks).astype(np.float32) / 32768.0
 
 
+# ── speech check: nothing that was said may go missing ───────────────────────
+#
+# Whisper can invent a stock line ("thanks for watching", "please subscribe")
+# over music, stamp it across a whole 30 s window and move on, so real speech
+# inside that window is never transcribed. None of Whisper's own checks fire,
+# because they need the model to be unsure and a memorised line is confident.
+# So an independent voice detector (the Silero VAD that faster-whisper ships)
+# maps where someone speaks, and that map decides what gets a second look:
+#   - a suspicious cue is transcribed again from where its speech starts
+#     (openai/whisper PR #1838: removing the silence before a hallucination is
+#     what gets a correct decode);
+#   - speech with no cue over it is transcribed on its own;
+#   - a stock line is removed only where the detector hears no voice at all.
+# The detector never cuts audio out of the first pass: it also misses singing
+# and quiet speech, so it may flag and trigger a re-decode, never delete.
+
+SUSPECT_CUE_SECONDS = 12.0    # subtitle standards cap a cue at 7 s; far longer is text stretched over other audio
+SPARSE_CUE_SECONDS = 7.0      # past the cap, also require a plausible amount of text
+MIN_UNCOVERED_SPEECH = 1.5    # seconds of voice with no cue over it worth a re-decode
+MIN_SPEECH_IN_CUE = 0.5       # less voice than this inside a cue counts as "no speech"
+REVIEW_UNHEARD_SECONDS = 3.0  # unrecognized voice shorter than this is not worth reporting
+SHORT_STOCK_SECONDS = 3.0    # a stock line this brief is removed without a second decode
+MAX_REDECODES = 40
+AGREE_RATIO = 0.6
+
+# Lines Whisper is known to invent over music or silence: subtitle credits and
+# channel outros memorised from its training data. Compared as whole cues after
+# phrase_key(). A match is a reason to check the audio, never proof.
+STOCK_PHRASES = (
+    "thanks for watching", "thank you for watching", "thank you so much for watching",
+    "please subscribe", "like and subscribe", "please like and subscribe",
+    "don't forget to subscribe", "subscribe to my channel", "please subscribe to my channel",
+    "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目", "請不吝點贊訂閱轉發打賞支持明鏡與點點欄目",
+    "請不吝點讚訂閱轉發打賞支持明鏡與點點欄目",
+    "感谢观看", "谢谢观看", "感謝觀看", "謝謝觀看", "谢谢收看", "謝謝收看",
+    "ご視聴ありがとうございました", "チャンネル登録お願いします", "チャンネル登録をお願いいたします",
+    "시청해주셔서 감사합니다", "구독과 좋아요 부탁드립니다",
+    "Hãy subscribe cho kênh Ghiền Mì Gõ Để không bỏ lỡ những video hấp dẫn",
+    "Hãy đăng ký kênh để ủng hộ kênh của mình nhé",
+    "Merci d'avoir regardé cette vidéo", "Vielen Dank fürs Zuschauen",
+    "Gracias por ver el video", "Субтитры сделал DimaTorzok", "Продолжение следует",
+    "TV Gelderland 2021",
+)
+# Credit lines whose ending varies (a name, a year).
+STOCK_PREFIXES = ("字幕志愿者", "字幕志願者", "中文字幕", "字幕by", "字幕提供", "优优独播剧场", "優優獨播劇場",
+                  "untertitelimauftragdeszdf", "subtitlesby", "subtitledby", "captionsby")
+STOCK_ANYWHERE = ("amaraorg",)
+
+
+def phrase_key(text: str) -> str:
+    """Text reduced to its letters, so spacing, punctuation, case and
+    full-width forms don't matter when comparing."""
+    text = unicodedata.normalize("NFKC", text or "").lower()
+    return "".join(c for c in text if unicodedata.category(c)[0] in "LN")
+
+
+_STOCK_KEYS = frozenset(phrase_key(p) for p in STOCK_PHRASES)
+
+
+def is_stock_phrase(text: str) -> bool:
+    key = phrase_key(text)
+    if not key:
+        return False
+    if key in _STOCK_KEYS or any(k in key for k in STOCK_ANYWHERE):
+        return True
+    return len(key) <= 30 and key.startswith(STOCK_PREFIXES)
+
+
+def speech_overlap(start: float, end: float, regions) -> float:
+    return sum(max(0.0, min(end, r1) - max(start, r0)) for r0, r1 in regions)
+
+
+def uncovered_speech(regions, covered, min_len: float) -> list:
+    """The parts of the speech regions that no (start, end) in `covered` spans."""
+    out, covered = [], sorted(covered)
+    for r0, r1 in regions:
+        cur = r0
+        for c0, c1 in covered:
+            if c1 <= cur:
+                continue
+            if c0 >= r1:
+                break
+            if c0 - cur >= min_len:
+                out.append((cur, c0))
+            cur = max(cur, c1)
+        if r1 - cur >= min_len:
+            out.append((cur, r1))
+    return out
+
+
+def _seg_end(seg) -> float:
+    return seg["start"] + seg["duration"]
+
+
+_UNSPACED_UNIT_RE = re.compile("([぀-ヿ㐀-䶿一-鿿฀-๿])")
+
+
+def _text_units(text: str) -> int:
+    """Characters for scripts written without spaces, words otherwise."""
+    return len(_UNSPACED_UNIT_RE.sub(r" \1 ", text).split())
+
+
+def suspect_reason(seg):
+    """Why a cue deserves a second decode, or None.
+
+    The word test is faster-whisper's own (word_anomaly_score, used by its
+    hallucination_silence_threshold): a word is odd when its probability is
+    under 0.15 or it lasts under 0.133 s or over 2 s.
+    """
+    if is_stock_phrase(seg["text"]):
+        return "a stock line that speech recognition often invents"
+    dur = seg["duration"]
+    if dur > SUSPECT_CUE_SECONDS:
+        return f"one line stretched over {dur:.0f} seconds"
+    if dur > SPARSE_CUE_SECONDS and _text_units(seg["text"]) / dur < 0.7:
+        return f"very little text for {dur:.0f} seconds"
+    score = 0.0
+    for start, end, prob in (seg.get("words") or [])[:8]:
+        length = end - start
+        if prob < 0.15:
+            score += 1.0
+        if length < 0.133:
+            score += (0.133 - length) * 15
+        elif length > 2.0:
+            score += length - 2.0
+    if score >= 3 or (seg.get("words") and score + 0.01 >= len(seg["words"][:8])):
+        return "word timing that does not fit the audio"
+    return None
+
+
+def _span(start: float, end: float) -> str:
+    return f"{fmt_ts(start)}-{fmt_ts(end)}"
+
+
+def guard_segments(segments: list, regions: list, redecode) -> tuple:
+    """Second-guess a Whisper transcript against the speech map.
+
+    `redecode(lo, hi)` transcribes just that stretch of audio and returns
+    segments in whole-file time. Returns (segments, check), where check lists
+    everything that was recovered, removed or left for a person to review.
+    """
+    recovered, removed, review, budget = [], [], [], [MAX_REDECODES]
+
+    def again(lo, hi):
+        if budget[0] <= 0:
+            return None
+        budget[0] -= 1
+        return [s for s in redecode(max(0.0, lo), hi) if s["text"].strip()]
+
+    kept = []
+    for i, seg in enumerate(segments):
+        reason = suspect_reason(seg)
+        if not reason:
+            kept.append(seg)
+            continue
+        start, end, stock = seg["start"], _seg_end(seg), is_stock_phrase(seg["text"])
+        inside = [(max(start, r0), min(end, r1)) for r0, r1 in regions if r1 > start and r0 < end]
+        voice = sum(b - a for a, b in inside) >= MIN_SPEECH_IN_CUE
+        if not voice and not stock:
+            kept.append(seg)  # probably singing, which the detector misses
+            continue
+        if not voice and end - start <= SHORT_STOCK_SECONDS:
+            # Invented, brief, and nobody is speaking: nothing can hide under it.
+            removed.append({"at": _span(start, end), "text": seg["text"],
+                            "reason": "a stock line with no voice in the audio there"})
+            continue
+        # The detector also misses speech over music, so a longer stock line
+        # is decoded again even where it hears no voice.
+        new = again(inside[0][0] - 1.0, inside[-1][1] + 1.0) if voice else again(start, end + 0.5)
+        if new is None:
+            kept.append(seg)
+            review.append({"at": _span(start, end), "reason": f"{reason}; not re-checked (too many to re-check)"})
+            continue
+        # Stay inside this cue's time, so the neighbours' words are not repeated.
+        new = [s for s in new if start - 0.5 <= (s["start"] + _seg_end(s)) / 2 <= end + 0.5]
+        old_key, new_key = phrase_key(seg["text"]), phrase_key("".join(s["text"] for s in new))
+        agree = new and SequenceMatcher(None, old_key, new_key, autojunk=False).ratio() >= AGREE_RATIO
+        real = [s for s in new if not is_stock_phrase(s["text"])]
+        if real and not agree and not voice:
+            # Invented text changes from one decode to the next and real speech
+            # does not. With no voice detected, new words count only if a third
+            # decode, from a shifted start, hears them again.
+            third = phrase_key("".join(s["text"] for s in again(start + 1.0, end + 0.5) or []))
+            real_key = phrase_key("".join(s["text"] for s in real))
+            if SequenceMatcher(None, real_key, third, autojunk=False).ratio() < AGREE_RATIO:
+                real = []
+        if agree and voice:
+            kept.append(seg)  # heard the same thing twice, the second time from the speech onset
+        elif real and not agree:
+            kept.extend(real)
+            recovered.append({"at": _span(real[0]["start"], _seg_end(real[-1])),
+                              "text": " ".join(s["text"] for s in real),
+                              "replaced": seg["text"], "reason": reason})
+        elif stock:
+            # Any voice under it is now uncovered: the pass below tries it once
+            # more on its own, and reports it for review if that fails too.
+            removed.append({"at": _span(start, end), "text": seg["text"],
+                            "reason": "a stock line; a second pass found nothing else there"})
+        else:
+            kept.append(seg)
+    kept.sort(key=lambda s: s["start"])
+
+    # Speech that no cue covers at all.
+    for u0, u1 in uncovered_speech(regions, [(s["start"], _seg_end(s)) for s in kept], MIN_UNCOVERED_SPEECH):
+        new = again(u0 - 0.5, u1 + 0.5)
+        near = phrase_key("".join(s["text"] for s in kept if _seg_end(s) > u0 - 10 and s["start"] < u1 + 10))
+        fresh = []
+        for s in new or []:
+            key = phrase_key(s["text"])
+            if key and key not in near and not is_stock_phrase(s["text"]):
+                s["start"] = max(s["start"], u0 - 0.5)
+                s["duration"] = max(0.2, min(_seg_end(s), u1 + 0.5) - s["start"])
+                fresh.append(s)
+        if fresh:
+            kept.extend(fresh)
+            recovered.append({"at": _span(fresh[0]["start"], _seg_end(fresh[-1])),
+                              "text": " ".join(s["text"] for s in fresh),
+                              "reason": "speech that the first pass skipped"})
+        elif u1 - u0 >= REVIEW_UNHEARD_SECONDS:
+            review.append({"at": _span(u0, u1),
+                           "reason": "a voice was detected but no words were recognized "
+                                     "(often singing, laughter or noise)"
+                                     + ("" if new is not None else "; not re-checked")})
+    kept.sort(key=lambda s: s["start"])
+
+    no_speech = [{"at": _span(s["start"], _seg_end(s)), "text": s["text"]} for s in kept
+                 if speech_overlap(s["start"], _seg_end(s), regions) < MIN_SPEECH_IN_CUE]
+    check = {
+        "status": "review" if review else "pass",
+        "speech_seconds": round(sum(r1 - r0 for r0, r1 in regions), 1),
+        "recovered": recovered or None,
+        "removed": removed or None,
+        "review": review or None,
+        "no_voice_lines": no_speech or None,
+    }
+    return kept, {k: v for k, v in check.items() if v is not None}
+
+
+def speech_regions(audio) -> list:
+    """Where someone speaks, as (start, end) seconds, from Silero VAD.
+
+    Tighter than faster-whisper's decode defaults, which pad and merge so much
+    that they over-report speech; 0.35 is the threshold stable-ts audits with.
+    """
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    opts = VadOptions(threshold=0.35, min_silence_duration_ms=400, speech_pad_ms=100,
+                      min_speech_duration_ms=250)
+    return [(t["start"] / 16000.0, t["end"] / 16000.0) for t in get_speech_timestamps(audio, opts)]
+
+
+def _whisper_pass(model, audio, lang, offset: float = 0.0, progress=None):
+    # vad_filter off: it drops singing and can collapse a music-heavy video
+    # into one cue. condition_on_previous_text off: one mis-heard segment
+    # otherwise cascades into repetition loops. word_timestamps on: tighter
+    # cue timing, and the per-word evidence suspect_reason() reads.
+    cues, info = model.transcribe(
+        audio, language=lang or None, beam_size=5, vad_filter=False,
+        condition_on_previous_text=False, word_timestamps=True,
+    )
+    segments = []
+    for cue in cues:  # a generator: the work happens here
+        text = (cue.text or "").strip()
+        if text:
+            segments.append({
+                "start": offset + float(cue.start),
+                "duration": max(0.0, float(cue.end - cue.start)),
+                "text": text,
+                "words": [(float(w.start), float(w.end), float(w.probability)) for w in (cue.words or [])],
+            })
+        if progress:
+            progress(float(cue.end))
+    return segments, info
+
+
 def transcribe_audio(path: Path, lang_hint: str = "") -> dict:
     pip_install(WHISPER_REQUIREMENT, "faster_whisper")
     from faster_whisper import WhisperModel
 
     name = whisper_model_name()
     device = os.environ.get("WHISPER_DEVICE", "").strip() or "cpu"
+    warnings, check, regions = [], None, None
     try:
         audio = decode_audio(path)
         log(f"whisper: loading model '{name}' (the first use downloads it)")
         model = WhisperModel(name, device=device,
                              compute_type="int8" if device == "cpu" else "float16",
                              cpu_threads=min(8, os.cpu_count() or 4))
-        # vad_filter off: it drops singing and can collapse a music-heavy video
-        # into one cue. condition_on_previous_text off: one mis-heard segment
-        # otherwise cascades into repetition loops.
-        cues, info = model.transcribe(
-            audio, language=_base_lang(lang_hint) or None, beam_size=5,
-            vad_filter=False, condition_on_previous_text=False,
-        )
-        total, segments, next_mark = float(info.duration or 0), [], 10
+        total, mark = len(audio) / 16000.0, [10]
+
+        def progress(done):
+            while total and done / total * 100 >= mark[0]:
+                log(f"whisper: {mark[0]}%")
+                mark[0] += 10
+
+        segments, info = _whisper_pass(model, audio, _base_lang(lang_hint), progress=progress)
         log(f"whisper: {fmt_ts(total)} of audio, language '{info.language}'")
-        for cue in cues:  # a generator: the work happens here
-            text = (cue.text or "").strip()
-            if text:
-                segments.append({"start": float(cue.start),
-                                 "duration": max(0.0, float(cue.end - cue.start)), "text": text})
-            while total and cue.end / total * 100 >= next_mark:
-                log(f"whisper: {next_mark}%")
-                next_mark += 10
+
+        def redecode(lo, hi):
+            clip = audio[int(lo * 16000):int(hi * 16000)]
+            if len(clip) < 8000:
+                return []
+            return _whisper_pass(model, clip, info.language, offset=lo)[0]
+
+        try:
+            regions = speech_regions(audio)
+        except Exception as e:  # a check that cannot run is reported, never a silent pass
+            warnings.append("The speech check could not run, so missing speech would not "
+                            f"have been noticed ({_short(e, 120)}).")
+            check = {"status": "not_run"}
+        else:
+            log("whisper: checking the transcript against where speech was detected")
+            segments, check = guard_segments(segments, regions, redecode)
     except SourceError:
         raise
     except Exception as e:
@@ -1092,6 +1381,8 @@ def transcribe_audio(path: Path, lang_hint: str = "") -> dict:
         raise SourceError(kind, f"whisper: {_short(e)}") from None
     if not segments:
         raise SourceError("failed", "whisper: no speech was recognized in the audio")
+    for seg in segments:
+        seg.pop("words", None)
     return {
         "source": "whisper",
         "transcript_type": "auto",
@@ -1101,6 +1392,9 @@ def transcribe_audio(path: Path, lang_hint: str = "") -> dict:
         "segments": segments,
         "model": name,
         "duration": int(total) or None,
+        "warnings": warnings,
+        "speech_check": check,
+        "speech_regions": regions,
     }
 
 
@@ -1214,6 +1508,29 @@ def write_parts(folder: Path, text: str) -> list:
         p.write_text(piece + "\n", encoding="utf-8")
         paths.append(str(p))
     return paths
+
+
+def marker_spans(segments, fmt: str, group_seconds: float, long_ts: bool) -> dict:
+    """The audio each "[N]" or "[mm:ss]" correction line covers, as marker -> [start, end]."""
+    if fmt == "srt":
+        return {str(i): [round(a, 2), round(b, 2)] for i, (a, b, _) in enumerate(srt_cues(segments), 1)}
+    if fmt != "timestamped" or not segments:
+        return {}
+    groups = group_cues(segments, group_seconds)
+    last = max(s["start"] + s["duration"] for s in segments)
+    spans = {}
+    for g, nxt in zip(groups, groups[1:] + [{"start": last}]):
+        key = fmt_ts(g["start"], long_ts)
+        spans[key] = [round(spans.get(key, [g["start"]])[0], 2), round(max(nxt["start"], g["start"]), 2)]
+    return spans
+
+
+def write_speech_map(folder: Path, regions, spans: dict) -> None:
+    """What apply_corrections.py needs to judge a deleted line without the audio."""
+    (folder / "speech.json").write_text(json.dumps({
+        "speech": [[round(a, 2), round(b, 2)] for a, b in regions],
+        "markers": spans,
+    }), encoding="utf-8")
 
 
 def source_detail(result) -> str:
@@ -1504,6 +1821,9 @@ def main(argv=None) -> int:
             and result["transcript_type"] == "auto" and not result.get("translated_to")):
         parts_dir = correction_dir(video_id or "file", fmt)
         parts = write_parts(parts_dir, render_cue_lines(segments) if fmt == "srt" else body)
+        if result.get("speech_regions") is not None:
+            write_speech_map(parts_dir, result["speech_regions"],
+                             marker_spans(segments, fmt, args.group_seconds, long_ts))
 
     plain = render_text(result) if fmt != "text" else body
     report = {
@@ -1517,6 +1837,7 @@ def main(argv=None) -> int:
         "needs_correction": True if parts else None,
         "parts_dir": str(parts_dir) if parts else None,
         "parts": parts or None,
+        "speech_check": result.get("speech_check"),
         "attempts": attempts,
         "warnings": warnings or None,
     }

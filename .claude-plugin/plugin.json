@@ -1,6 +1,6 @@
 {
   "name": "youtube-skills",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Get the subtitles or transcript of any YouTube video (youtube-sub). Uses the video's own subtitles, has Claude correct YouTube's auto-generated captions when there are none, and transcribes the audio locally with Whisper when the video has no captions at all.",
   "author": {
     "name": "Ender Phan",

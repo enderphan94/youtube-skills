@@ -104,11 +104,12 @@ flowchart TD
     L([An audio or video file]) --> W
     X --> W
 
+    W --> S[Speech check: a voice detector maps<br/>where someone speaks. Suspicious lines and<br/>speech with no text are transcribed again]
     A --> P[Split into parts<br/>of about 8,000 characters]
-    W --> P
-    P --> C[Claude corrects each part:<br/>mis-heard words, punctuation,<br/>capitals, invented lines removed]
+    S --> P
+    P --> C[Claude corrects each part:<br/>mis-heard words, punctuation, capitals.<br/>It may propose removing an invented line]
     C --> V{apply_corrections.py<br/>checks each part}
-    V -- "pass" --> M[Corrected text goes into the file.<br/>For .srt, timing is never touched]
+    V -- "pass" --> M[Corrected text goes into the file.<br/>For .srt, timing is never touched.<br/>A line is removed only where<br/>no voice was detected]
     V -- "fail: paraphrased, summarized,<br/>wrong language, lost a timestamp" --> K[That part keeps<br/>the original text]
 
     H --> O([Your file: .txt, timestamped .txt, .srt or .json])
@@ -144,6 +145,20 @@ Design choices worth knowing:
   script fetches the same captions through the hosted
   [YouGist](https://yougist.kuberscan.com) backend, which receives only the
   video URL. Set `YOUGIST_BACKEND=off` to disable this.
+- **Nothing that was said should go missing.** Whisper sometimes invents a line
+  over music ("thanks for watching", a subtitle credit), stamps it across a
+  whole 30-second window, and skips real speech inside that window. So after
+  transcribing, a voice detector (Silero VAD, which ships with faster-whisper)
+  maps where someone speaks. A suspicious line (a known invented phrase, a line
+  stretched over more than 12 seconds, or one with odd word timing) is
+  transcribed again from where its speech starts. Speech with no text over it
+  is transcribed on its own. The detector only triggers a second look and never
+  cuts audio, because it misses singing and speech over music.
+- **Claude cannot delete speech.** While correcting, Claude can only propose
+  removing a line it thinks was invented. The script removes it only where no
+  voice was detected, and otherwise puts the text back and says so. Every
+  removed or recovered line, and every stretch where a voice was heard but no
+  words were recognized, is listed in the report and passed on to you.
 - **Audio transcription is local and never automatic.** It is slow (about a
   minute per 10 minutes of audio on a fast laptop) and downloads a large model
   once, so Claude starts it only after the normal fetch reports that the video
@@ -178,6 +193,7 @@ All are environment variables. None is required.
 | "YouTube is blocking requests from your IP" | Wait and retry, set `YT_PROXY_URL`, or set `GEMINI_API_KEY` |
 | The audio download fails with "Sign in to confirm you're not a bot" | YouTube is blocking this network. Download the video yourself and give Claude the file, or set `YT_PROXY_URL` |
 | The audio download fails for another reason | Install Node.js 22+ or Deno, which YouTube downloads need |
+| Part of the speech is missing from a transcribed video | Tell Claude roughly when ("there is dialogue from 0:20"). It will transcribe that stretch again |
 | Audio transcription is too slow or inaccurate | Set `WHISPER_MODEL` to a smaller (`small`) or larger (`large-v3`) model |
 | Wrong language | Ask for the one you want: *"the English subtitles"* |
 | "could not set up the private Python environment" | `python3 -m pip install 'youtube-transcript-api>=1.2'` |

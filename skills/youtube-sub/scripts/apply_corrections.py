@@ -14,6 +14,13 @@ is worse on average than doing nothing, so every check fails closed: a part
 that looks wrong keeps its original text, and nothing is ever lost.
 The checks are a port of YouGist's polishLooksSane() (background.js).
 
+Deleting is checked separately, because a text-only editor cannot hear the
+audio. Claude may empty a "[N]" or "[mm:ss]" line it believes the recognizer
+invented, but the line is removed only when the speech map that
+fetch_transcript.py saved (speech.json) shows no voice in that line's stretch
+of audio. Otherwise the original text is put back and the refusal is reported:
+a line that reads like an invented credit can still sit on top of real speech.
+
 A corrected part is rejected when:
   1. it is missing or empty;
   2. its [mm:ss] timestamps or [N] cue numbers differ from the original's;
@@ -52,6 +59,7 @@ FOREIGN_SCRIPT_RE = re.compile(
 _UNSPACED_RE = re.compile("([぀-ヿ㐀-䶿一-鿿฀-๿])")
 # A line-leading [mm:ss] / [h:mm:ss] timestamp or [N] cue number.
 MARKER_RE = re.compile(r"^\[(\d+(?::\d\d){0,2})\]", re.MULTILINE)
+_LINE_RE = re.compile(r"^\[(\d+(?::\d\d){0,2})\][ \t]*(.*)$")
 _HEADER_LINE_RE = re.compile(r"^[A-Z][A-Za-z ]{1,15}:\s")
 CORRECTED_NOTE = (
     "Corrected: punctuation and mis-heard words repaired by Claude; parts that "
@@ -87,12 +95,31 @@ def edit_rate(a: list, b: list) -> float:
     return (max(n, m) - matched) / n
 
 
+def without_emptied_lines(original: str, corrected: str) -> str:
+    """The original minus the marker lines the correction left empty.
+
+    A proposed deletion is judged by gate_deletions() against the audio, so it
+    must not count against the edit budget, or removing one invented line from
+    a short clip would reject the whole part.
+    """
+    emptied = [not m.group(2).strip() for m in map(_LINE_RE.match, map(str.strip, corrected.splitlines())) if m]
+    out, i = [], 0
+    for line in original.splitlines():
+        if _LINE_RE.match(line.strip()):
+            i += 1
+            if i <= len(emptied) and emptied[i - 1]:
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def check(original: str, corrected: str):
     """Return (accepted, reason)."""
     if not corrected or not corrected.strip():
         return False, "missing or empty"
     if MARKER_RE.findall(corrected) != MARKER_RE.findall(original):
         return False, "timestamps or cue numbers were changed, added or dropped"
+    original = without_emptied_lines(original, corrected)
     before, after = script_ratio(original), script_ratio(corrected)
     if after > 0.02 and after > before * 3 + 0.01:
         return False, "language drift (a writing system the original does not use)"
@@ -103,6 +130,54 @@ def check(original: str, corrected: str):
     if rate > MAX_EDIT_RATE:
         return False, f"{rate:.0%} of words changed (paraphrased, limit {MAX_EDIT_RATE:.0%})"
     return True, f"{rate:.0%} of words changed"
+
+
+MIN_SPEECH_IN_LINE = 0.5  # seconds of detected voice that make a line undeletable
+
+
+def load_speech_map(parts_dir: Path):
+    try:
+        data = json.loads((parts_dir / "speech.json").read_text(encoding="utf-8"))
+        return data if isinstance(data.get("markers"), dict) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def gate_deletions(original: str, corrected: str, speech):
+    """Allow an emptied marker line only where no voice was detected.
+
+    Returns (text, removed, refused). A refused line gets its original text
+    back. With no speech map (YouTube captions, or the check could not run)
+    there is no evidence, so every deletion is refused.
+    """
+    before = [m for m in (_LINE_RE.match(line.strip()) for line in original.splitlines()) if m]
+    out, removed, refused, i = [], [], [], 0
+    for line in corrected.splitlines():
+        m = _LINE_RE.match(line.strip())
+        if not m or i >= len(before):
+            out.append(line)
+            continue
+        old, i = before[i], i + 1
+        if m.group(2).strip() or not old.group(2).strip():
+            out.append(line)
+            continue
+        marker, span = m.group(1), None
+        if speech:
+            span = speech["markers"].get(marker)
+        if span is None:
+            reason = "there is no record of the audio behind this line, so nothing shows it is safe to delete"
+        else:
+            voice = sum(max(0.0, min(span[1], b) - max(span[0], a)) for a, b in speech.get("speech") or [])
+            reason = (None if voice < MIN_SPEECH_IN_LINE else
+                      f"a voice is heard for {voice:.1f} s of this line's audio, so real speech may be under it")
+        entry = {"line": f"[{marker}]", "text": old.group(2).strip()}
+        if reason:
+            refused.append({**entry, "reason": reason})
+            out.append(old.group(0))
+        else:
+            removed.append(entry)
+            out.append(line)
+    return "\n".join(out), removed, refused
 
 
 def split_header(document: str):
@@ -154,12 +229,17 @@ def main(argv=None) -> int:
         print(json.dumps({"ok": False, "error": f"transcript file not found: {out}"}))
         return 2
 
-    sections, rejected = [], []
+    speech = load_speech_map(parts_dir)
+    sections, rejected, removed, refused = [], [], [], []
     for part in parts:
         original = part.read_text(encoding="utf-8").strip()
         fixed_path = parts_dir / "corrected" / part.name
         fixed = fixed_path.read_text(encoding="utf-8").strip() if fixed_path.exists() else ""
         ok, reason = check(original, fixed)
+        if ok:
+            fixed, gone, kept = gate_deletions(original, fixed, speech)
+            removed += gone
+            refused += kept
         sections.append(fixed if ok else original)
         if not ok:
             rejected.append({"part": part.name, "reason": reason})
@@ -183,10 +263,14 @@ def main(argv=None) -> int:
 
     print(json.dumps({
         "ok": True,
+        # "review" means something needs a person's attention: tell the user.
+        "status": "review" if rejected or refused else "pass",
         "out": str(out),
         "parts": len(parts),
         "accepted": accepted,
         "kept_original": rejected or None,
+        "removed_lines": removed or None,
+        "deletions_refused": refused or None,
     }, ensure_ascii=False, indent=2))
     return 0
 
